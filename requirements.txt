@@ -1,0 +1,41 @@
+# requirements.txt — проект Prj_16_OCR (OCR кассовых чеков)
+# Среда: Windows 10, Python 3.12.9, только CPU (CUDA недоступен на этой машине).
+# Версии выбраны так, чтобы зеркально повторить набор, уже проверенный
+# в глобальном окружении этой машины (см. п.1 ARCHITECTURE) — ноль новых пакетов.
+#
+# Установка:  .venv\Scripts\python.exe -m pip install -r requirements.txt
+#
+# Примечание про torch: строка ниже ставит дефолтный wheel с PyPI.
+# Если нужен компактный CPU-only wheel (~ в 2 раза меньше), ставить отдельно:
+#   pip install torch==2.14.1 torchvision==0.29.1 --index-url https://download.pytorch.org/whl/cpu
+# (torch/torchvision можно исключить из этого файла в таком случае.)
+
+# --- Рантайм: конвейер обработки изображений ---
+opencv-python-headless==5.0.0.93   # геометрия: rectify, deskew, remap, morphology
+numpy==2.5.4
+scipy==1.18.1
+scikit-image==0.26.0
+pillow==12.2.0                     # EXIF-ориентация, декод/кодирование в RAM
+
+# --- Рантайм: OCR-движок Фазы 1 (модели уже скачаны в %USERPROFILE%\.EasyOCR) ---
+easyocr==1.7.2                     # тянет: PyYAML, python-bidi, shapely, pyclipper
+torch==2.14.1
+torchvision==0.29.1
+
+# --- Конфигурация ---
+PyYAML==6.0.3
+
+# --- Обёртка Tesseract (опционально) ---
+# pytesseract==0.3.13 — нужна ТОЛЬКО для digits-only re-read (Фаза 3).
+# Требует установленный бинарник tesseract.exe (сейчас на машине отсутствует!)
+# и языковые данные rus.traineddata. Для остальных стадий OCR не требуется.
+pytesseract==0.3.13
+
+# ===== Фаза 2 (устанавливать ТОЛЬКО если бенчмарки Фазы 1 не дотянут) =====
+# pip install rapidocr onnxruntime          # PP-OCRv4/v5 models via ONNX Runtime, ~25-50 МБ
+# rapidocr
+# onnxruntime
+
+# ===== Фаза 3 (опционально — разворот «волнистых» чеков) =====
+# Модель UVDoc grid-ONNX (~30 МБ) кладётся вручную в data/models/
+# и запускается через уже установленный onnxruntime — pip-пакеты не нужны.

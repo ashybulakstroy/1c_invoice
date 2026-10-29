@@ -1,0 +1,10 @@
+# requirements-dev.txt — инструменты разработки/тестов Prj_16_OCR
+# Установка:  .venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+#
+# pytest — единственный пакет, отсутствующий сейчас и глобально, и в .venv.
+# Нужен для измеримых тестов точности/скорости из ARCHITECTURE (§6–7):
+# tests/accuracy, tests/perf (бюджеты латентности), tests/threading (санити потоков).
+# Версия не зафиксирована: пакета ещё нет в проверенном окружении, фиксируем
+# после первой установки (pip freeze) для воспроизводимости.
+
+pytest
