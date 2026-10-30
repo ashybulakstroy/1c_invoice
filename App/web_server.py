@@ -20,8 +20,9 @@ import cv2
 from pydantic import ValidationError
 
 from App.ocr_catalog_eval import PASS_SIMILARITY, ROOT
-from App.exchange import (EXCHANGE_KEY_HEADER, ExchangeAuth, ExchangeConflict, ExchangeError,
-                          ExchangeNotFound, ExchangeStore, task_document)
+from App.exchange import (ExchangeConflict, ExchangeError, ExchangeNotFound, ExchangeStore,
+                          task_document)
+from App.exchange import multipart
 from App.web_pipeline import ReceiptPipeline
 from App.receipt_editing import apply_edit, save_receipt, update_receipt
 from App.server_config import ServerSettings, server_settings
@@ -175,8 +176,7 @@ class ReceiptHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
 
-def create_server(host=None, port=None, output_dir=None, processor=None, max_upload=20*1024*1024,
-                  exchange_key_path=None):
+def create_server(host=None, port=None, output_dir=None, processor=None, max_upload=20*1024*1024):
     if host is None or port is None:
         settings = server_settings()
         host = settings.host if host is None else host
@@ -184,7 +184,6 @@ def create_server(host=None, port=None, output_dir=None, processor=None, max_upl
     root_dir = Path(output_dir) if output_dir is not None else ROOT / "web_outputs"
     store = JobStore(root_dir, processor, max_upload)
     exchange = ExchangeStore(root_dir / "exchange")
-    exchange_auth = ExchangeAuth(exchange_key_path)
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -206,9 +205,6 @@ def create_server(host=None, port=None, output_dir=None, processor=None, max_upl
         def send_json(self, data, status=200):
             self.send_data(json.dumps(data, ensure_ascii=False).encode(), "application/json; charset=utf-8", status)
 
-        def authorized(self):
-            return exchange_auth.check(self.headers.get(EXCHANGE_KEY_HEADER))
-
         def base_url(self):
             host = (self.headers.get("Host") or "").strip()
             if not host or len(host) > 200:
@@ -216,8 +212,6 @@ def create_server(host=None, port=None, output_dir=None, processor=None, max_upl
             return "http://" + host
 
         def exchange_create(self):
-            if not self.authorized():
-                return self.send_json(dict(error="Требуется ключ API обмена"), 401)
             try:
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
@@ -245,6 +239,41 @@ def create_server(host=None, port=None, output_dir=None, processor=None, max_upl
                 return self.send_json(dict(error="Тело задания должно быть корректным JSON"), 400)
             return self.send_json(task_document(task, self.base_url()), 201 if created else 200)
 
+        def exchange_photo(self, task_id):
+            try:
+                task = exchange.get(task_id)
+            except ExchangeNotFound as error:
+                self.close_connection = True  # the request body stays unread
+                return self.send_json(dict(error=str(error)), 404)
+            if task.job_id:
+                self.close_connection = True
+                return self.send_json(dict(error="У задания уже есть фото. Новое фото принимается только для нового задания из 1С."), 409)
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                length = 0
+            if length <= 0:
+                return self.send_json(dict(error="Пустая загрузка фото"), 400)
+            if length > store.max_upload + 65536:
+                self.close_connection = True
+                return self.send_json(dict(error=f"Выберите изображение размером до {store.max_upload//1024//1024} МБ."), 413)
+            data = self.rfile.read(length)
+            if len(data) != length:
+                return self.send_json(dict(error="Фото загружено не полностью"), 400)
+            try:
+                filename, photo = multipart.file_part(self.headers.get("Content-Type"), data)
+            except multipart.MultipartError as error:
+                return self.send_json(dict(error=str(error)), 400)
+            if len(photo) > store.max_upload:
+                self.close_connection = True
+                return self.send_json(dict(error=f"Выберите изображение размером до {store.max_upload//1024//1024} МБ."), 413)
+            job = store.submit(photo, filename)
+            try:
+                task = exchange.bind_job(task_id, job.id)
+            except ExchangeConflict as error:
+                return self.send_json(dict(error=str(error)), 409)
+            return self.send_json(task_document(task, self.base_url()), 202)
+
         def do_GET(self):
             parts = urlparse(self.path)
             path = unquote(parts.path)
@@ -257,8 +286,17 @@ def create_server(host=None, port=None, output_dir=None, processor=None, max_upl
                 return self.send_json(dict(ok=True, pass_similarity=PASS_SIMILARITY, max_upload_bytes=store.max_upload,
                                            exchange=True))
             if path.startswith("/tasks"):
-                if not self.authorized():
-                    return self.send_json(dict(error="Требуется ключ API обмена"), 401)
+                page = re.fullmatch(r"/tasks/([a-f0-9]{32})/ui", path)
+                if page:
+                    return self.send_data((STATIC / "index.html").read_bytes(),
+                                          "text/html; charset=utf-8")
+                page_state = re.fullmatch(r"/tasks/([a-f0-9]{32})/ui/state", path)
+                if page_state:
+                    try:
+                        task = exchange.get(page_state[1])
+                    except ExchangeNotFound as error:
+                        return self.send_json(dict(error=str(error)), 404)
+                    return self.send_json(task_document(task, self.base_url()))
                 route = re.fullmatch(r"/tasks/([a-f0-9]{32})", path)
                 if route:
                     try:
@@ -363,6 +401,9 @@ def create_server(host=None, port=None, output_dir=None, processor=None, max_upl
             parts = urlparse(self.path)
             if parts.path == "/tasks":
                 return self.exchange_create()
+            photo_route = re.fullmatch(r"/tasks/([a-f0-9]{32})/photos", parts.path)
+            if photo_route:
+                return self.exchange_photo(photo_route[1])
             edit_route = re.fullmatch(r"/api/jobs/([a-f0-9]{32})/edits", parts.path)
             invoice_route = re.fullmatch(r"/api/jobs/([a-f0-9]{32})/invoice/(preview|preview-pdf|selections|train)", parts.path)
             if parts.path != "/api/jobs" and edit_route is None and invoice_route is None:

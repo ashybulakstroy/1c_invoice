@@ -100,7 +100,7 @@ def _text(value, name: str, limit: int = 128) -> str:
 
 
 def task_document(task: ExchangeTask, base_url: str = "") -> dict:
-    """Public task state; never contains the exchange key or photo contents."""
+    """Public task state; contains no secrets and no photo contents."""
     ui_url = f"/tasks/{task.task_id}/ui"
     if base_url:
         ui_url = base_url.rstrip("/") + ui_url

@@ -1,5 +1,6 @@
 'use strict';
-const freshStart=new URLSearchParams(location.search).get('new')==='1';
+const TASK=(location.pathname.match(/^\/tasks\/([a-f0-9]{32})\/ui\/?$/)||[])[1]||null;
+const freshStart=!TASK&&new URLSearchParams(location.search).get('new')==='1';
 if(freshStart){try{localStorage.removeItem('receipt-last-job');}catch{}history.replaceState(null,'','/');}
 const $ = id => document.getElementById(id);
 const SVG_NS = 'http://www.w3.org/2000/svg';
@@ -475,15 +476,33 @@ async function upload(file){
   const preview=new Image();preview.src=state.blob;preview.onload=()=>{if(token===state.token&&!state.assets.has('original'))addArtifact({key:'original',role:'original',title:'Исходное фото',subtitle:file.name,url:preview.src,width:preview.naturalWidth,height:preview.naturalHeight});};
   $('process-title').textContent='Загружаем фотографию';$('process-subtitle').textContent=file.name;
   try{
-    const response=await fetch('/api/jobs?filename='+encodeURIComponent(file.name||'clipboard.png'),{method:'POST',headers:{'Content-Type':file.type||'application/octet-stream'},body:file});
+    const response=TASK?postTaskPhoto(file):fetch('/api/jobs?filename='+encodeURIComponent(file.name||'clipboard.png'),{method:'POST',headers:{'Content-Type':file.type||'application/octet-stream'},body:file});
     const job=await response.json();if(!response.ok)throw Error(job.error||'Не удалось загрузить фотографию');if(token!==state.token)return;
-    state.job=job.id;window.ReceiptUploadGate?.accepted(token);try{localStorage.setItem('receipt-last-job',job.id);}catch{}listen(job.id,token);
+    state.job=job.job_id||job.id;if(TASK)updateTaskBadge(job);window.ReceiptUploadGate?.accepted(token);try{localStorage.setItem('receipt-last-job',state.job);}catch{}listen(state.job,token);
   }catch(error){if(token===state.token)showError(error.message||'Не удалось связаться с сервером');}
 }
-async function restore(){
-  if(freshStart)return;
-  let id;try{id=localStorage.getItem('receipt-last-job');}catch{return;}if(!id||!/^\w{32}$/.test(id))return;
+function postTaskPhoto(file){
+  const form=new FormData();form.append('file',file,file.name||'clipboard.png');
+  return fetch(`/tasks/${TASK}/photos`,{method:'POST',body:form});
+}
+const TASK_LABELS={waiting_photo:'ожидает фото',review:'проверка чека',confirmed:'подтверждено для 1С',applied:'применено в 1С'};
+function updateTaskBadge(task){
+  const badge=$('task-badge');if(!badge||!TASK)return;
+  badge.hidden=false;badge.className='task-badge'+(task?.state==='confirmed'||task?.state==='applied'?' done':'');
+  badge.textContent='Задание 1С: '+(TASK_LABELS[task?.state]||'недоступно');
+  if(task?.job_id){$('choose-top').hidden=true;$('paste-top').hidden=true;}
+}
+async function restoreTask(){
   const token=state.token;
+  try{
+    const response=await fetch(`/tasks/${TASK}/ui/state`);
+    if(!response.ok){updateTaskBadge(null);showError('Задание 1С не найдено. Откройте его заново из 1С.');return;}
+    const task=await response.json();if(token!==state.token)return;
+    updateTaskBadge(task);
+    if(task.job_id)await loadJob(task.job_id,token);
+  }catch{toast('Нет связи с сервером задания 1С');}
+}
+async function loadJob(id,token){
   try{
     const response=await fetch(`/api/jobs/${id}`);if(!response.ok)return;const job=await response.json();if(token!==state.token)return;
     state.job=id;window.ReceiptUploadGate?.restored(job);$('drop-zone').hidden=true;$('empty-result').hidden=true;
@@ -496,10 +515,16 @@ async function restore(){
     }else if(job.status==='failed')showError(job.error);else{window.OcrActivity?.start();$('process-card').classList.add('busy');setPill('Обработка','processing');listen(id,token);}
   }catch{}
 }
+async function restore(){
+  if(TASK)return restoreTask();
+  if(freshStart)return;
+  let id;try{id=localStorage.getItem('receipt-last-job');}catch{return;}if(!id||!/^\w{32}$/.test(id))return;
+  await loadJob(id,state.token);
+}
 document.querySelector('.app-header').addEventListener('click',event=>{
   if(event.target.closest('.debug-toggle'))return;
   if(event.button!==0||event.ctrlKey||event.metaKey||event.shiftKey||event.altKey)return;
-  event.preventDefault();try{localStorage.removeItem('receipt-last-job');}catch{}location.assign('/?new=1');
+  event.preventDefault();if(TASK){location.reload();return;}try{localStorage.removeItem('receipt-last-job');}catch{}location.assign('/?new=1');
 });
 $('debug-toggle').checked=false;
 $('debug-toggle').addEventListener('change',event=>document.body.classList.toggle('debug-mode',event.target.checked));

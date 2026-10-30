@@ -1,4 +1,7 @@
 /* Invoice panel (Etap 5) styling; independent namespace inv-* under the shared tokens. */
+.task-badge{font-size:11px;line-height:20px;padding:2px 9px;border-radius:20px;background:#edf2ff;color:#2859db;white-space:nowrap;border:1px solid #d5e0fb}
+.task-badge.done{background:#e8f6ef;color:#168269;border-color:#c8e8d8}
+@media(max-width:1050px){.task-badge{font-size:10px}}
 .receipt-upload-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}
 .input-panel>.panel-heading{gap:12px}
 @media(max-width:1200px){.input-panel>.panel-heading{height:auto;min-height:102px;flex-wrap:wrap}.receipt-upload-actions .button{padding:8px 10px;font-size:12px}}

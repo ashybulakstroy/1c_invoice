@@ -4,7 +4,6 @@ The package does not duplicate OCR, invoice generation or mapping rules: it
 binds an open 1C form (``request_id``) to a normal №16 job, freezes confirmed
 invoice snapshots and serves the 1.1 contract to the 1C extension.
 """
-from App.exchange.auth import ExchangeAuth, HEADER as EXCHANGE_KEY_HEADER
 from App.exchange.store import (
     ExchangeConflict,
     ExchangeError,
@@ -15,8 +14,6 @@ from App.exchange.store import (
 )
 
 __all__ = [
-    "ExchangeAuth",
-    "EXCHANGE_KEY_HEADER",
     "ExchangeConflict",
     "ExchangeError",
     "ExchangeNotFound",
