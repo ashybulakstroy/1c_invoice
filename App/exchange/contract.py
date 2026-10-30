@@ -1,0 +1,180 @@
+"""Frozen 1C result snapshot (contract 1.1).
+
+Builds the document handed to 1C from the already verified invoice model and
+the verified receipt snapshot. Nothing here runs OCR or re-validates receipt
+amounts: ``invoice_model`` remains the single source of the invoice, and the
+receipt fingerprint plus selections are captured in an input revision so a
+later edit can invalidate the confirmation.
+
+The checksum is the SHA-256 of the canonical UTF-8 JSON *without* the checksum
+field: sorted keys, compact separators, Cyrillic not ASCII-escaped — the same
+rule as ``receipt_adapter._canonical``.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import time
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
+
+from App.invoicing.invoice_service import _catalog_signature, _issuer_signature
+from App.invoicing.receipt_adapter import snapshot_from_receipt
+
+SCHEMA_VERSION = "1.1"
+STATUS_CONFIRMED = "confirmed"
+CURRENCY = "KZT"
+CONFIRMED_TARGETS = {"manual", "remembered", "learned"}
+
+
+def _canonical(payload) -> bytes:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+                      default=str).encode("utf-8")
+
+
+def checksum(payload: dict) -> str:
+    """Checksum of the snapshot body; the ``checksum`` field itself is ignored."""
+    body = {key: value for key, value in payload.items() if key != "checksum"}
+    return hashlib.sha256(_canonical(body)).hexdigest()
+
+
+def input_revision(receipt: dict, selections: dict | None = None) -> str:
+    """Identifies the inputs a confirmation was made from.
+
+    Changes to the receipt, saved selections, catalog files or the issuer make
+    the confirmation stale even when no explicit invalidation happened.
+    """
+    snapshot = snapshot_from_receipt(receipt)
+    payload = {
+        "receipt_fingerprint": snapshot.fingerprint,
+        "selections": selections or {},
+        "catalog_signature": _catalog_signature(),
+        "issuer_signature": _issuer_signature(),
+    }
+    return hashlib.sha256(_canonical(payload)).hexdigest()
+
+
+def _decimal(value, default: Decimal | None = None) -> Decimal | None:
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return default
+
+
+def _factor_text(row: dict, quantity: Decimal | None, source: Decimal | None) -> str:
+    factor = row.get("quantity_factor")
+    if factor in (None, ""):
+        if row.get("service") or not source:
+            factor = Decimal(1)
+        else:
+            factor = (quantity or Decimal(0)) / source
+    number = _decimal(factor)
+    if number is None:
+        return "1"
+    return format(number.normalize(), "f")
+
+
+def _target(row: dict) -> dict | None:
+    """One 1C target row; ``None`` means the invoice row has no 1C product."""
+    if not row.get("name"):
+        return None
+    service = bool(row.get("service"))
+    quantity = _decimal(row.get("quantity"))
+    source = _decimal(row.get("source_quantity"))
+    return {
+        "code": row.get("code"),
+        "uuid": None,
+        "catalog_id": row.get("catalog_id"),
+        "name": row["name"],
+        "unit": row.get("unit") or ("усл" if service else ""),
+        "service": service,
+        "quantity_mode": row.get("quantity_mode") or ("service" if service else "factor"),
+        "quantity_factor": _factor_text(row, quantity, source),
+        "quantity": str(row.get("quantity")),
+        "price": str(row.get("price")),
+        "amount": str(row.get("amount")),
+    }
+
+
+def _allowed_targets(row: dict) -> list[dict]:
+    """Confirmed alternatives of the same source card, never search proposals."""
+    allowed, seen = [], set()
+    for option in row.get("approved_targets") or []:
+        target = _target(option)
+        if target is None:
+            continue
+        if option.get("conditions"):
+            target["conditions"] = option["conditions"]
+        key = (target["code"], target["name"], target["unit"], target["service"],
+               target["quantity_mode"], target["quantity"])
+        if key in seen:
+            continue
+        seen.add(key)
+        allowed.append(target)
+    return allowed
+
+
+def _source(row: dict, line=None) -> dict:
+    article = row.get("source_article") or (getattr(line, "article", "") if line else "") or None
+    identity = row.get("source_identity") or (f"torgsoft:article:{article}" if article else None)
+    return {
+        "name": row.get("source_name"),
+        "article": article,
+        "identity": identity,
+        "quantity": str(row.get("source_quantity")),
+        "price": str(row.get("source_price")),
+        "amount": str(row.get("source_amount")),
+    }
+
+
+def build_snapshot(task, model: dict, receipt: dict, version: int, now: float | None = None) -> dict:
+    """JSON 1.1 snapshot for one confirmation of ``task``.
+
+    ``model`` is the current ``invoice_service.invoice_model`` result; the
+    caller must have checked ``finalized``, ``validation_status`` and ``ready``.
+    """
+    receipt_snapshot = snapshot_from_receipt(receipt)
+    receipt_lines = {str(line.row_id): line for line in receipt_snapshot.lines}
+    items = []
+    for row in model["generation"]["items"]:
+        status = row.get("match_status")
+        if status not in CONFIRMED_TARGETS:
+            raise ValueError(f"Строка {row.get('row_id')} не подтверждена для 1С.")
+        target = _target(row)
+        if target is None:
+            raise ValueError(f"Строка {row.get('row_id')} не имеет номенклатуры 1С.")
+        row_id = str(row.get("row_id"))
+        items.append({
+            "row_id": row_id,
+            "photo_id": task.job_id,
+            "source": _source(row, receipt_lines.get(row_id)),
+            "target": target,
+            "allowed_targets": _allowed_targets(row),
+            "selection_policy": "explicit" if status == "manual" else "approved_alternatives",
+        })
+    document = model["document"]
+    moment = time.time() if now is None else now
+    confirmed_at = (datetime.fromtimestamp(moment, timezone.utc)
+                    .isoformat(timespec="seconds").replace("+00:00", "Z"))
+    snapshot = {
+        "schema_version": SCHEMA_VERSION,
+        "status": STATUS_CONFIRMED,
+        "task_id": task.task_id,
+        "database_id": task.database_id,
+        "request_id": task.request_id,
+        "document_uuid": task.document_uuid,
+        "result_version": version,
+        "revision": model.get("revision"),
+        "currency": CURRENCY,
+        "prices_include_vat": True,
+        "date": document.get("date"),
+        "source_order_number": receipt_snapshot.order_number,
+        "vat_rate": (str(receipt_snapshot.vat.rate_percent)
+                     if receipt_snapshot.vat.rate_percent is not None else None),
+        "vat_amount": document.get("vat_amount"),
+        "total": document.get("total"),
+        "confirmed_at": confirmed_at,
+        "items": items,
+    }
+    snapshot["checksum"] = checksum(snapshot)
+    return snapshot

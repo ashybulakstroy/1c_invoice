@@ -3,6 +3,7 @@
    Reads the shared page state and helpers from app.js; touches no OCR behavior. */
 (function invoicePanel(){
 const $ = id => document.getElementById(id);
+const TASK=window.OCRTask||null;
 const INV = {jobId:null, revision:null, model:null, picks:new Map(), busy:false, dirty:false, pdfUrl:null};
 
 function clearPdf(){
@@ -245,9 +246,40 @@ function render(){
   $('invoice-empty').hidden=true;$('invoice-content').hidden=false;
 }
 
+function refreshTaskConfirm(){
+  const button=$('invoice-confirm'),note=$('invoice-confirm-state');
+  if(!button||!note)return;
+  if(!TASK){button.hidden=true;note.hidden=true;return;}
+  const task=TASK.state||{};
+  const revision=INV.model?.revision||null;
+  const confirmed=task.state==='confirmed'||task.state==='applied';
+  const current=confirmed&&!task.stale_reason&&!!revision&&task.revision===revision;
+  button.hidden=false;note.hidden=false;
+  button.disabled=INV.busy||INV.dirty||!INV.model?.ready||current;
+  button.textContent=current?'Подтверждено для 1С':(confirmed||task.stale_reason?'Подтвердить заново':'Подтвердить для 1С');
+  note.className='task-badge'+(current?' done':task.stale_reason?' wait':'');
+  note.textContent=task.state==='applied'?`Применено в 1С, версия ${task.result_version}`:
+    current?`Снимок для 1С: версия ${task.result_version}`:
+    task.stale_reason?'Результат изменён — подтвердите заново':
+    task.state==='confirmed'?'Счёт изменён после подтверждения':'Ещё не подтверждено для 1С';
+}
+
+async function confirmFor1C(){
+  if(!TASK||!INV.model)return;
+  INV.busy=true;refresh();
+  try{
+    const task=await TASK.confirm(INV.model.revision);
+    toast(`Результат зафиксирован для 1С (версия ${task.result_version}). Вернитесь в 1С и нажмите «Получить результат».`);
+  }catch(error){
+    const reason=error.reasons&&error.reasons.length?' Первое замечание: '+error.reasons[0]:'';
+    toast((error.message||'Не удалось подтвердить результат')+reason);
+  }finally{INV.busy=false;refresh();}
+}
+
 function refresh(){
   $('invoice-save').disabled=INV.busy;$('invoice-preview').disabled=INV.busy;
   $('invoice-train').disabled=INV.busy||INV.dirty||!INV.model?.ready;
+  refreshTaskConfirm();
   if(INV.model)render();
 }
 
@@ -290,12 +322,14 @@ async function send(action){
     if(!response.ok){toast(model.error||'Сервер не принял выбор');return;}
     if(action==='train'){
       toast(`Обучение сохранено: ${model.training.remembered} связей`);
+      if(TASK)await TASK.refresh();
       return;
     }
     INV.model=model;
     INV.dirty=false;clearPdf();
     if(action==='selections')pickFromRows(model);
     await loadPrintPreview(payload);
+    if(TASK)await TASK.refresh();
     refresh();
     toast(action==='selections'?'Связи сохранены':'Предпросмотр построен (изменения не сохранены)');
   }catch(error){toast('Счёт недоступен: '+error.message);}
@@ -318,6 +352,7 @@ function sync(){
   clearPdf();INV.dirty=false;
   INV.model=null;INV.picks=new Map();
   $('invoice-content').hidden=true;$('invoice-empty').hidden=false;
+  if(TASK)TASK.refresh();
   refresh();
   refreshModel();
 }
@@ -331,6 +366,7 @@ function start(){
   $('invoice-save').addEventListener('click',()=>send('selections'));
   $('invoice-preview').addEventListener('click',()=>send('preview'));
   $('invoice-train').addEventListener('click',()=>send('train'));
+  $('invoice-confirm')?.addEventListener('click',confirmFor1C);
   setInterval(sync,1200);
 }
 start();

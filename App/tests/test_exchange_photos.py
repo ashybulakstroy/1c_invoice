@@ -111,6 +111,7 @@ def test_task_page_is_open_and_restores_job(server):
         assert response.headers["Content-Type"].startswith("text/html")
         html = response.read().decode("utf-8")
     assert "/invoice.js" in html
+    assert 'id="invoice-confirm"' in html
     with get(f"{base}/tasks/{task['task_id']}/ui/state") as response:
         state = json.load(response)
     assert state["task_id"] == task["task_id"] and state["job_id"] is None

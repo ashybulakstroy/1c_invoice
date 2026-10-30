@@ -486,12 +486,38 @@ function postTaskPhoto(file){
   return fetch(`/tasks/${TASK}/photos`,{method:'POST',body:form});
 }
 const TASK_LABELS={waiting_photo:'ожидает фото',review:'проверка чека',confirmed:'подтверждено для 1С',applied:'применено в 1С'};
+let TASK_STATE=null;
 function updateTaskBadge(task){
-  const badge=$('task-badge');if(!badge||!TASK)return;
-  badge.hidden=false;badge.className='task-badge'+(task?.state==='confirmed'||task?.state==='applied'?' done':'');
-  badge.textContent='Задание 1С: '+(TASK_LABELS[task?.state]||'недоступно');
+  const badge=$('task-badge');
+  if(!TASK){return;}
+  TASK_STATE=task||null;
+  if(!badge)return;
+  badge.hidden=false;
+  badge.className='task-badge'+(task?.state==='confirmed'||task?.state==='applied'?' done':task?.stale_reason?' wait':'');
+  badge.textContent='Задание 1С: '+(TASK_LABELS[task?.state]||'недоступно')+(task?.stale_reason?' · нужно подтвердить заново':'');
   if(task?.job_id){$('choose-top').hidden=true;$('paste-top').hidden=true;}
 }
+window.OCRTask=TASK?{
+  id:TASK,
+  get state(){return TASK_STATE;},
+  async refresh(){
+    try{
+      const response=await fetch(`/tasks/${TASK}/ui/state`);
+      if(!response.ok)return null;
+      const task=await response.json();updateTaskBadge(task);return task;
+    }catch{return null;}
+  },
+  async confirm(revision){
+    const response=await fetch(`/tasks/${TASK}/confirm`,{
+      method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({revision})});
+    const data=await response.json().catch(()=>({}));
+    if(!response.ok){
+      const error=Error(data.error||'Не удалось подтвердить результат для 1С');
+      error.reasons=data.reasons||[];throw error;
+    }
+    updateTaskBadge(data);return data;
+  }
+}:null;
 async function restoreTask(){
   const token=state.token;
   try{

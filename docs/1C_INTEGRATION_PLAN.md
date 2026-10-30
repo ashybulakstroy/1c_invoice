@@ -63,7 +63,7 @@ M2–M6 — по плану ниже. Код стороны 1С ещё не со
 | Генерация счёта | `App/invoicing/invoice_service.py`: `invoice_model()`, выбор связей `invoice_state.json`, `revision`/`token`, PDF | Готово; источник данных для снимка 1С |
 | Каталог 1С | `App/invoicing/catalog_1c.py`: коды, единицы, товары/услуги; **UUID нет** (`uuid: null`) | Идентичность по коду/артикулу — как в контракте 1.1 |
 | Маппинг и обучение | `User_Mapping/Torgsoft_1C_mapping.json`, `learned_mapping.py`, `transform_candidates.py` | Готово; альтернативы попадают в `allowed_targets` |
-| Обмен с 1С | M1–M2: пакет `App/exchange/` — реестр заданий, `POST/GET /tasks`, `POST /tasks/{id}/photos`; страница `/tasks/{id}/ui` в режиме задания; подтверждение/результат/квитанции ещё нет | Каркас и фото готовы; остальные маршруты — M3–M4 |
+| Обмен с 1С | M1–M3: пакет `App/exchange/` — реестр заданий, `POST/GET /tasks`, фото, `POST /tasks/{id}/confirm`, `GET /tasks/{id}/result` (JSON 1.1); страница `/tasks/{id}/ui`; квитанции и XML ещё нет | Подтверждённый снимок готов; остальное — M4 |
 
 ## 3. Целевая архитектура
 
@@ -175,18 +175,24 @@ M2–M6 — по плану ниже. Код стороны 1С ещё не со
 | **M0. Решения** | Согласовать: `database_id` базы «Алатау»; режим `prices_include_vat`; необходимость multipart именно с `file`; доступ к тестовой базе 1С; открытость сайта и API | Зафиксированные параметры в `.env` и плане |
 | **M1. Ядро обмена** | `App/exchange/`: store, contract; маршруты `POST/GET /tasks`, `/api/health`; тесты идемпотентности | `POST /tasks` дважды → одно задание |
 | **M2. Фото и страница задания** | `POST /tasks/{id}/photos` (multipart), привязка к `JobStore`, страница `/tasks/{id}/ui` + режим в `app.js` | Фото из 1С-задания распознаётся; повтор другого фото → 409 |
-| **M3. Подтверждение и результат** | `confirm`, `result` JSON/XML, версии, checksum, 202/200/409; инвалидация при правках | Снимок неизменяем; после правок без confirm → 409 |
-| **M4. Квитанции** | `import-receipt` (`applied`/`error`), `document-link`, восстановление после рестарта | Повтор той же квитанции безопасен; смена тела → 409 |
+| **M3. Подтверждение и результат** | `confirm`, `result` JSON 1.1, версии, checksum, 202/200/409; инвалидация при правках | ✅ Снимок неизменяем; после правок без confirm → 409 |
+| **M4. Квитанции и XML** | `import-receipt` (`applied`/`error`), `document-link`, `result.xml`, восстановление после рестарта | Повтор той же квитанции безопасен; смена тела → 409 |
 | **M5. Расширение 1С** | По `docs/1C_EXTENSION_SPEC.md` на основе `OCRClient.bsl`/`OCRFormCommands.bsl`: команды, видимость, заполнение без записи, дефицит, регистр, applied | Сквозной сценарий на тестовой базе 3.0.75.1 |
 | **M6. Пилот** | Реальные чеки, сбои сети, повторные нажатия, мобильный браузер | Подписанный чек-лист приёмки |
 
-Текущий статус (30.10.2026): **M1 и M2 выполнены** — создан `App/exchange/`
-(`store.py`, `multipart.py`), маршруты `POST /tasks`, `GET /tasks/{id}`,
-`POST /tasks/{id}/photos`, страница `/tasks/{task_id}/ui` и
+Текущий статус (30.10.2026): **M1–M3 выполнены** (M3 — в объёме JSON;
+XML-выдача перенесена в M4). Создан `App/exchange/` (`store.py`,
+`multipart.py`, `contract.py`), маршруты `POST /tasks`, `GET /tasks/{id}`,
+`POST /tasks/{id}/photos`, `POST /tasks/{id}/confirm`,
+`GET /tasks/{id}/result`, страница `/tasks/{task_id}/ui` и
 `GET /tasks/{task_id}/ui/state`, `GET /api/health` с признаком `exchange`.
-Сетевая аутентификация не используется по решению пользователя. Тесты:
-`test_exchange_store.py`, `test_exchange_api.py`, `test_exchange_photos.py`
-— 15 PASS; существующие тесты веб-сервера — 17 PASS, регрессий нет.
+Сетевая аутентификация не используется по решению пользователя.
+Подтверждение фиксирует `result-vN.json` с каноническим checksum; правка
+чека, сохранение связей и обучение инвалидируют его. Тесты:
+`test_exchange_store.py`, `test_exchange_api.py`, `test_exchange_photos.py`,
+`test_exchange_confirm.py` — 23 PASS; существующие тесты веб-сервера и
+счёта — без регрессий (полный прогон: 274 PASS, 13 прежних FAIL из-за
+отсутствующих `data/in_data/*` и одного расхождения справочника).
 
 После M4 сквозная проверка возможна без 1С (curl/Postman + страница);
 M5 требует доступа к тестовой базе и платформы 8.3.23 (в среде разработки
@@ -195,11 +201,11 @@ M5 требует доступа к тестовой базе и платфор�
 ## 6. Изменения по файлам (предварительно)
 
 - **Новое:** `App/exchange/__init__.py`, `store.py`, `multipart.py`,
-  `contract.py`, `service.py`; тесты `App/tests/test_exchange_*.py`.
+  `contract.py`; тесты `App/tests/test_exchange_*.py`.
 - **`App/web_server.py`:** маршруты `/tasks...`, multipart-разбор,
-  `GET /tasks/{id}/ui` → `index.html`; переиспользование `JobStore`.
-- **`App/invoicing/invoice_service.py`:** helper сборки снимка для 1С
-  (без изменения существующих контрактов UI/PDF).
+  подтверждение/результат и инвалидация; переиспользование `JobStore`.
+- **`App/invoicing/invoice_service.py`:** не изменялся; снимок собирает
+  `App/exchange/contract.py` из `invoice_model()` без повторного OCR.
 - **`App/web/index.html`, `app.js`, `invoice.js`:** режим задания, кнопка
   «Подтвердить для 1С», статусы; без ломки текущего сценария.
 - **`.env`:** `OCR_EXCHANGE_DATABASE_ID` (или существующий

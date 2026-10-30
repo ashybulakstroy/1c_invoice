@@ -52,6 +52,9 @@ class ExchangeTask:
     job_id: str | None = None
     result_version: int = 0
     confirmed_at: float | None = None
+    confirmed_revision: str | None = None
+    input_revision: str | None = None
+    stale_reason: str | None = None
     result: dict = field(default_factory=dict)
     receipts: list[dict] = field(default_factory=list)
 
@@ -64,6 +67,8 @@ class ExchangeTask:
     def state(self) -> str:
         if self.applied is not None:
             return STATE_APPLIED
+        if self.stale_reason:
+            return STATE_REVIEW
         if self.confirmed_at is not None and self.result.get("checksum"):
             return STATE_CONFIRMED
         if self.job_id:
@@ -81,6 +86,9 @@ class ExchangeTask:
             "created_at": self.created_at,
             "result_version": self.result_version,
             "confirmed_at": self.confirmed_at,
+            "confirmed_revision": self.confirmed_revision,
+            "input_revision": self.input_revision,
+            "stale_reason": self.stale_reason,
             "result": dict(self.result),
             "receipts": [dict(receipt) for receipt in self.receipts],
         }
@@ -116,6 +124,7 @@ def task_document(task: ExchangeTask, base_url: str = "") -> dict:
         "result_version": task.result_version,
         "revision": task.result.get("revision"),
         "checksum": task.result.get("checksum"),
+        "stale_reason": task.stale_reason,
         "applied": applied is not None,
         "receipts": len(task.receipts),
         "ui_url": ui_url,
@@ -151,6 +160,12 @@ class ExchangeStore:
                     result_version=int(data.get("result_version") or 0),
                     confirmed_at=(float(data["confirmed_at"])
                                   if data.get("confirmed_at") is not None else None),
+                    confirmed_revision=(_text(data["confirmed_revision"], "confirmed_revision")
+                                        if data.get("confirmed_revision") else None),
+                    input_revision=(_text(data["input_revision"], "input_revision")
+                                    if data.get("input_revision") else None),
+                    stale_reason=(_text(data["stale_reason"], "stale_reason", 500)
+                                  if data.get("stale_reason") else None),
                     result=dict(data.get("result") or {}),
                     receipts=[dict(receipt) for receipt in data.get("receipts") or []],
                 )
@@ -213,4 +228,75 @@ class ExchangeStore:
             if task.job_id != job_id:
                 task.job_id = job_id
                 self._save(task)
+            return task
+
+    def for_job(self, job_id: str) -> ExchangeTask | None:
+        """The 1C task bound to a normal job, if any (used for its database context)."""
+        if not isinstance(job_id, str) or not JOB_ID.fullmatch(job_id):
+            return None
+        with self.lock:
+            return next((task for task in self.tasks.values() if task.job_id == job_id), None)
+
+    def result_path(self, task: ExchangeTask, version: int) -> Path:
+        return self.root / task.task_id / f"result-v{version}.json"
+
+    def load_result(self, task: ExchangeTask) -> dict | None:
+        path = self.result_path(task, task.result_version)
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def confirm(self, task_id: str, revision: str, input_revision: str,
+                snapshot_factory) -> tuple[ExchangeTask, bool]:
+        """Freeze a new result version or return the matching confirmation.
+
+        ``snapshot_factory(version)`` builds the full JSON snapshot while the
+        registry lock is held, so the version and checksum cannot race another
+        confirmation of the same task.
+        """
+        with self.lock:
+            task = self.get(task_id)
+            if (task.confirmed_at is not None and not task.stale_reason
+                    and task.confirmed_revision == revision
+                    and task.input_revision == input_revision
+                    and task.result.get("checksum")):
+                return task, False
+            version = task.result_version + 1
+            snapshot = snapshot_factory(version)
+            if snapshot.get("revision") != revision:
+                raise ExchangeConflict("Снимок не соответствует подтверждаемой ревизии счёта")
+            path = self.result_path(task, version)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2),
+                                 encoding="utf-8")
+            temporary.replace(path)
+            task.result_version = version
+            task.confirmed_at = time.time()
+            task.confirmed_revision = revision
+            task.input_revision = input_revision
+            task.stale_reason = None
+            task.result = {
+                "version": version,
+                "revision": revision,
+                "checksum": snapshot["checksum"],
+                "confirmed_at": snapshot.get("confirmed_at"),
+                "items": len(snapshot.get("items") or []),
+                "total": snapshot.get("total"),
+            }
+            self._save(task)
+            return task, True
+
+    def invalidate_job(self, job_id: str, reason: str) -> ExchangeTask | None:
+        """Mark a confirmed result stale after the receipt or links changed."""
+        with self.lock:
+            task = self.for_job(job_id)
+            if task is None or task.applied is not None:
+                return None
+            if task.confirmed_at is None or task.stale_reason:
+                return None
+            task.stale_reason = reason or "Данные счёта изменились; подтвердите результат заново."
+            self._save(task)
             return task

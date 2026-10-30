@@ -21,7 +21,7 @@ from pydantic import ValidationError
 
 from App.ocr_catalog_eval import PASS_SIMILARITY, ROOT
 from App.exchange import (ExchangeConflict, ExchangeError, ExchangeNotFound, ExchangeStore,
-                          task_document)
+                          contract, task_document)
 from App.exchange import multipart
 from App.web_pipeline import ReceiptPipeline
 from App.receipt_editing import apply_edit, save_receipt, update_receipt
@@ -274,6 +274,135 @@ def create_server(host=None, port=None, output_dir=None, processor=None, max_upl
                 return self.send_json(dict(error=str(error)), 409)
             return self.send_json(task_document(task, self.base_url()), 202)
 
+        def invoice_context(self, job):
+            """Database context of a 1C task bound to the job, if any."""
+            task = exchange.for_job(job.id)
+            return task.database_id if task else None
+
+        def exchange_confirm(self, task_id):
+            try:
+                task = exchange.get(task_id)
+            except ExchangeNotFound as error:
+                self.close_connection = True
+                return self.send_json(dict(error=str(error)), 404)
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                length = 0
+            if length < 0:
+                length = 0
+            if length > 65536:
+                self.close_connection = True
+                return self.send_json(dict(error="Слишком большой запрос подтверждения"), 413)
+            data = self.rfile.read(length) if length else b"{}"
+            if len(data) != length:
+                return self.send_json(dict(error="Запрос подтверждения загружен не полностью"), 400)
+            try:
+                payload = json.loads(data or b"{}")
+                if not isinstance(payload, dict):
+                    raise ValueError("not an object")
+            except (ValueError, TypeError):
+                return self.send_json(dict(error="Тело подтверждения должно быть JSON-объектом"), 400)
+            revision = payload.get("revision")
+            if revision is not None and not isinstance(revision, str):
+                return self.send_json(dict(error="revision: требуется строка"), 400)
+            for key, expected in (("database_id", task.database_id),
+                                  ("request_id", task.request_id)):
+                value = payload.get(key)
+                if value not in (None, "") and str(value).strip().casefold() != expected.casefold():
+                    return self.send_json(dict(error=f"Задание относится к другой базе/форме ({key})"), 409)
+            if not task.job_id:
+                return self.send_json(dict(error="Сначала загрузите фото в задание."), 409)
+            job = store.get(task.job_id)
+            if job is None:
+                return self.send_json(dict(error="Задание обработки не найдено. Загрузите фото заново."), 409)
+            with job.condition:
+                if job.status != "done" or not job.result:
+                    return self.send_json(dict(error="Дождитесь завершения распознавания и проверки чека."), 409)
+                receipt = job.result
+                selections = invoice_service.load_selections(job)
+                try:
+                    model = invoice_service.invoice_model(receipt, selections=selections,
+                                                          database_id=self.invoice_context(job))
+                except ValueError as error:
+                    return self.send_json(dict(error=str(error)), 409)
+                except Exception:
+                    return self.send_json(dict(error="Счёт не построен: внутренняя ошибка расчёта."), 500)
+                reasons = []
+                if not model.get("finalized"):
+                    reasons.append("Электронный чек не подтверждён оператором.")
+                if model.get("validation_status") != "match":
+                    status = model.get("validation_status") or "нет данных"
+                    reasons.append(f"Чек не сверен полностью ({status}).")
+                if not model.get("ready"):
+                    reasons.extend(model.get("blocked") or [])
+                reasons = list(dict.fromkeys(reasons))
+                if reasons:
+                    return self.send_json(dict(error="Счёт ещё не готов для 1С.", reasons=reasons,
+                                               state=task.state), 409)
+                if revision and revision != model.get("revision"):
+                    return self.send_json(dict(
+                        error="Счёт изменился после загрузки страницы. Обновите страницу и подтвердите заново.",
+                        reasons=["Ревизия счёта не совпадает с подтверждаемой."]), 409)
+                try:
+                    fingerprint = contract.input_revision(receipt, selections)
+                    current = task
+                    task, created = exchange.confirm(
+                        task.task_id, model["revision"], fingerprint,
+                        lambda version: contract.build_snapshot(current, model, receipt, version))
+                except ValueError as error:
+                    return self.send_json(dict(error=str(error)), 409)
+                except ExchangeConflict as error:
+                    return self.send_json(dict(error=str(error)), 409)
+                except OSError:
+                    return self.send_json(dict(error="Не удалось сохранить снимок результата."), 500)
+            document = task_document(task, self.base_url())
+            document["created"] = created
+            return self.send_json(document)
+
+        def exchange_result(self, task_id, query):
+            try:
+                task = exchange.get(task_id)
+            except ExchangeNotFound as error:
+                return self.send_json(dict(error=str(error)), 404)
+            params = parse_qs(query)
+            for key, expected in (("database_id", task.database_id),
+                                  ("request_id", task.request_id)):
+                value = (params.get(key) or [""])[0].strip()
+                if value and value.casefold() != expected.casefold():
+                    return self.send_json(dict(
+                        error="Задание относится к другой базе/форме 1С. Форму не менять."), 409)
+            if task.stale_reason:
+                return self.send_json(dict(
+                    error="Результат изменён после подтверждения. Подтвердите его заново.",
+                    reasons=[task.stale_reason], state=task.state), 409)
+            if task.confirmed_at is None or not task.result.get("checksum"):
+                return self.send_json(dict(error="Результат ещё не подтверждён.",
+                                           state=task.state,
+                                           ui_url=task_document(task)["ui_url"]), 202)
+            job = store.get(task.job_id) if task.job_id else None
+            if job is not None:
+                current = None
+                with job.condition:
+                    if job.status == "done" and job.result:
+                        try:
+                            current = contract.input_revision(
+                                job.result, invoice_service.load_selections(job))
+                        except ValueError:
+                            current = None
+                if current and task.input_revision and current != task.input_revision:
+                    exchange.invalidate_job(
+                        job.id, "Данные счёта изменились после подтверждения; подтвердите результат заново.")
+                    return self.send_json(dict(
+                        error="Результат изменён после подтверждения. Подтвердите его заново.",
+                        reasons=["Изменились чек, связи номенклатуры или справочник 1С."]), 409)
+            snapshot = exchange.load_result(task)
+            if (snapshot is None or snapshot.get("checksum") != task.result.get("checksum")
+                    or contract.checksum(snapshot) != snapshot.get("checksum")):
+                return self.send_json(dict(
+                    error="Снимок результата не найден или повреждён. Подтвердите результат заново."), 409)
+            return self.send_json(snapshot)
+
         def do_GET(self):
             parts = urlparse(self.path)
             path = unquote(parts.path)
@@ -297,6 +426,9 @@ def create_server(host=None, port=None, output_dir=None, processor=None, max_upl
                     except ExchangeNotFound as error:
                         return self.send_json(dict(error=str(error)), 404)
                     return self.send_json(task_document(task, self.base_url()))
+                result_route = re.fullmatch(r"/tasks/([a-f0-9]{32})/result", path)
+                if result_route:
+                    return self.exchange_result(result_route[1], parts.query)
                 route = re.fullmatch(r"/tasks/([a-f0-9]{32})", path)
                 if route:
                     try:
@@ -332,7 +464,8 @@ def create_server(host=None, port=None, output_dir=None, processor=None, max_upl
                         return self.send_json(dict(error="Дождитесь завершения распознавания."), 409)
                 try:
                     model = invoice_service.invoice_model(job.result,
-                                                          selections=invoice_service.load_selections(job))
+                                                          selections=invoice_service.load_selections(job),
+                                                          database_id=self.invoice_context(job))
                 except ValueError as error:
                     return self.send_json(dict(error=str(error)), 409)
                 except Exception:
@@ -345,7 +478,8 @@ def create_server(host=None, port=None, output_dir=None, processor=None, max_upl
                         return self.send_json(dict(error="Дождитесь завершения распознавания."), 409)
                 try:
                     model = invoice_service.invoice_model(job.result,
-                                                          selections=invoice_service.load_selections(job))
+                                                          selections=invoice_service.load_selections(job),
+                                                          database_id=self.invoice_context(job))
                 except ValueError as error:
                     return self.send_json(dict(error=str(error)), 409)
                 try:
@@ -404,6 +538,9 @@ def create_server(host=None, port=None, output_dir=None, processor=None, max_upl
             photo_route = re.fullmatch(r"/tasks/([a-f0-9]{32})/photos", parts.path)
             if photo_route:
                 return self.exchange_photo(photo_route[1])
+            confirm_route = re.fullmatch(r"/tasks/([a-f0-9]{32})/confirm", parts.path)
+            if confirm_route:
+                return self.exchange_confirm(confirm_route[1])
             edit_route = re.fullmatch(r"/api/jobs/([a-f0-9]{32})/edits", parts.path)
             invoice_route = re.fullmatch(r"/api/jobs/([a-f0-9]{32})/invoice/(preview|preview-pdf|selections|train)", parts.path)
             if parts.path != "/api/jobs" and edit_route is None and invoice_route is None:
@@ -445,6 +582,8 @@ def create_server(host=None, port=None, output_dir=None, processor=None, max_upl
                         save_receipt(job.directory, updated)
                         job.result = updated
                         job.persist()
+                    exchange.invalidate_job(
+                        job.id, "Чек изменён после подтверждения для 1С; подтвердите результат заново.")
                     return self.send_json(dict(result=updated, mapping_saved=bool(learned)))
                 except RuntimeError as error:
                     return self.send_json(dict(error=str(error)), 409)
@@ -471,20 +610,33 @@ def create_server(host=None, port=None, output_dir=None, processor=None, max_upl
                         return self.send_json(dict(error="Подтвердите обучение связям явно."), 400)
                     try:
                         from App.invoicing.training_pairs import training_lock
+                        context = self.invoice_context(job)
                         with training_lock:
-                            result = invoice_service.train_from_selections(job.result, clean)
+                            if context:
+                                result = invoice_service.train_from_selections(
+                                    job.result, clean, database_id=context)
+                            else:
+                                result = invoice_service.train_from_selections(job.result, clean)
                     except ValueError as error:
                         return self.send_json(dict(error=str(error)), 409)
                     except Exception:
                         return self.send_json(dict(error="Не удалось сохранить обучение; проверьте журнал и хранилища."), 500)
+                    exchange.invalidate_job(
+                        job.id, "Обучение связям изменило счёт; подтвердите результат заново.")
                     return self.send_json(dict(training=result))
             if action == "selections":
+                with job.condition:
+                    previous = invoice_service.load_selections(job)
                 try:
                     clean = invoice_service.save_selections(job, clean)
                 except OSError as error:
                     return self.send_json(dict(error=str(error)), 500)
+                if clean != previous:
+                    exchange.invalidate_job(
+                        job.id, "Связи номенклатуры изменены после подтверждения; подтвердите результат заново.")
             try:
-                model = invoice_service.invoice_model(job.result, selections=clean)
+                model = invoice_service.invoice_model(job.result, selections=clean,
+                                                      database_id=self.invoice_context(job))
                 if action == "preview-pdf":
                     pdf = invoice_service.render_invoice(model, model["revision"], model["token"])
                     return self.send_data(pdf, "application/pdf")
