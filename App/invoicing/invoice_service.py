@@ -166,29 +166,44 @@ def _row_candidates(row: dict) -> dict[str, Any]:
         result["remembered"] = [{**item, "origin": "remembered"} for item in remembered]
     except (ValueError, TypeError, InvalidOperation):
         pass
+    from App.invoicing.catalog_1c import search_catalog
+    existing = {item.get('id') or item.get('catalog_id') for item in result['items']}
+    matches = search_catalog(row.get('name') or '', limit=10)
+    if not matches['items'] and article:
+        from App.invoicing.ai_matching import proposals as ai_proposals
+        ai=ai_proposals(row.get('name') or '',catalog(),article=article,limit=10)
+        matches['items']=ai['items']
+        matches['errors']=matches['errors']+ai['errors']
+    result['errors'].extend(matches['errors'])
+    for item in matches['items']:
+        if item['id'] not in existing:
+            result['items'].append({**item, 'origin': 'ai_matching' if item.get('match_method')=='ai_matching' else 'search'})
+            existing.add(item['id'])
+    result['items'] = result['items'][:10]
+    # Proposal/remembered contracts may omit stock metadata; use live identity only.
+    from App.invoicing.catalog_1c import catalog_item
+    for candidate in result['items'] + result['remembered']:
+        card = catalog_item(candidate.get('catalog_id') or candidate.get('id'))
+        if card:
+            candidate['accounting_price'] = card.get('accounting_price')
     return result
 
 
 def _exact_amounts(source: dict, generation_result: dict) -> list[str]:
-    """Verify gross invoice amounts against receipt net lines plus printed VAT.
-
-    VAT is allocated proportionally with the rounding remainder on the last
-    line, as in the donor. This is an invoice calculation, never an OCR edit.
-    """
+    """Check receipt amounts, with printed VAT allocated when included in prices."""
     CENT = Decimal("0.01")
     UNIT_PRICE_STEP = generation.UNIT_PRICE_STEP
     lines = {item["row_id"]: item for item in source["items"]}
-    net_total = sum((Decimal(str(item.get("amount") or 0)) for item in source["items"]), Decimal(0))
-    vat = Decimal(str(source.get("vat_amount") or 0))
-    allocated = Decimal(0)
-    gross = {}
-    for index, item in enumerate(source["items"]):
-        net = Decimal(str(item.get("amount") or 0))
-        share = (vat * net / net_total).quantize(CENT, rounding=ROUND_HALF_UP) if net_total else Decimal(0)
-        if index == len(source["items"]) - 1:
-            share = vat - allocated
-        allocated += share
-        gross[item["row_id"]] = net + share
+    additions = {}
+    if generation_result.get('vat_in_line_amounts'):
+        net_total = sum((Decimal(str(item.get('amount') or 0)) for item in source['items']),Decimal(0))
+        vat = Decimal(str(source.get('vat_amount') or 0))
+        allocated = Decimal(0)
+        for index,item in enumerate(source['items']):
+            share=(vat*Decimal(str(item.get('amount') or 0))/net_total).quantize(CENT,rounding=ROUND_HALF_UP) if net_total else Decimal(0)
+            if index==len(source['items'])-1:share=vat-allocated
+            additions[item['row_id']]=share
+            allocated+=share
     problems = []
     for row in generation_result["items"]:
         line = lines.get(row["row_id"])
@@ -202,7 +217,7 @@ def _exact_amounts(source: dict, generation_result: dict) -> list[str]:
         if exact is None:
             problems.append(f"Строка {row['row_id']}: в проверенном чеке нет суммы строки; счёт не может быть построен.")
             continue
-        exact = gross[row["row_id"]].quantize(CENT, rounding=ROUND_HALF_UP)
+        exact = (exact+additions.get(row['row_id'],Decimal(0))).quantize(CENT, rounding=ROUND_HALF_UP)
         try:
             current = Decimal(str(row["amount"]))
         except InvalidOperation:
@@ -218,7 +233,7 @@ def _exact_amounts(source: dict, generation_result: dict) -> list[str]:
 
 
 def invoice_model(receipt: dict, selections: dict[str, dict] | None = None,
-                  suggest: bool = False, database_id: str | None = None) -> dict:
+                  suggest: bool = True, database_id: str | None = None) -> dict:
     """Full model for GET/preview: generation, document, candidates, readiness."""
     snapshot = snapshot_from_receipt(receipt)
     source = to_generation_source(snapshot)
@@ -240,8 +255,19 @@ def invoice_model(receipt: dict, selections: dict[str, dict] | None = None,
         clean[str(row_id)] = entry
     generation_result = generation.build_generation(source,
                                                     selections=clean or None,
-                                                    suggest=suggest, database_id=database_id)
+                                                    suggest=suggest, database_id=database_id, vat_in_line_amounts=vat_text is not None,
+                                                    preserve_receipt_quantities=True)
     amount_problems = _exact_amounts(source, generation_result)
+    rounding_notes=[]
+    if vat_text is not None:
+        generation_result['price_decimal_places']=2
+        for row in generation_result['items']:
+            price=Decimal(str(row['price'])).quantize(Decimal('.01'),rounding=ROUND_HALF_UP)
+            row['price']=format(price,'.2f')
+            difference=(Decimal(str(row['quantity']))*price-Decimal(str(row['amount']))).quantize(Decimal('.01'),rounding=ROUND_HALF_UP)
+            row['price_rounding_difference']=str(difference)
+            if difference:
+                rounding_notes.append(f"Строка {row['row_id']}: округление цены до 2 знаков даёт разницу {difference} ₸ при умножении на количество; сумма строки и итог сохранены из чека с НДС.")
     if vat_text:
         # Keep the printed receipt tax; never take a tax amount from a catalog.
         generation_result["vat_amount"] = vat_text
@@ -269,6 +295,7 @@ def invoice_model(receipt: dict, selections: dict[str, dict] | None = None,
         "revision": revision,
         "token": document["token"],
         "selections": stored,
+        "rounding_notes": rounding_notes,
     }
 
 

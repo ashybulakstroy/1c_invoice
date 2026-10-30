@@ -37,3 +37,13 @@ def test_quantity_and_price_labels_identify_header_even_when_name_is_unreadable(
                line('Товар', 180, 90), line('2', 370, 90), line('100', 460, 90)]
     rows = parse_rows(aligned_lines(dict(lines=payload), {}), LAYOUT, [10, 60, 120])
     assert len(rows) == 1 and rows[0]['name_raw'] == 'Товар'
+
+
+@pytest.mark.parametrize('marker',['N8','No','№','1'])
+def test_header_excludes_numeric_noise_and_all_content_above_it(marker):
+    payload=[line('Кассир 100',180,15),line(marker,30,40),line('Тауардың атауы',180,40),
+             line('Саны',370,40),line('Багасы',460,40),line('Доска',180,90),
+             line('51',370,90),line('1880',460,90)]
+    rows=parse_rows(aligned_lines(dict(lines=payload),{}),LAYOUT,[0,25,60,120])
+    assert len(rows)==1 and rows[0]['name_raw']=='Доска'
+    assert (rows[0]['quantity_raw'],rows[0]['price_raw'])==('51','1880')

@@ -81,11 +81,14 @@ def main():
             checks["save"] = True
             page.reload(wait_until="networkidle")
             expect(page.locator(".inv-selection")).to_have_count(3, timeout=20000)
+            expect(page.locator("#invoice-save")).to_be_enabled(timeout=20000)
             expect(page.locator(".inv-qty").first).to_have_value("2")
             checks["reload_preserves_choice"] = True
             # Replace an existing choice through a different real catalog card.
             row = page.locator(".inv-row").first
-            row.locator(".inv-search").fill("цемент")
+            with page.expect_response(lambda response: '/api/catalog-1c?q=' in response.url):
+                row.locator(".inv-search").fill("цемент")
+            page.wait_for_function("document.querySelector('.inv-row .inv-option')?.textContent.toLowerCase().includes('цемент')")
             expect(row.locator(".inv-option").first).to_be_visible()
             row.locator(".inv-option").first.click()
             expect(page.locator("#invoice-pdf")).to_be_hidden()

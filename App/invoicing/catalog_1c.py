@@ -230,7 +230,7 @@ def catalog(directory=CATALOG_DIR):
     return _load(signature)
 
 
-def search_catalog(query, limit=30, directory=CATALOG_DIR, include_invoices=False):
+def default_search_catalog(query, limit=30, directory=CATALOG_DIR, include_invoices=False):
     index = catalog(directory)
     items = index["items"]
     choices = index["keys"]
@@ -269,6 +269,32 @@ def search_catalog(query, limit=30, directory=CATALOG_DIR, include_invoices=Fals
     return {"items": selected, "total": len(items), "files": index["files"], "errors": index["errors"]}
 
 
+def search_catalog(query, limit=30, directory=CATALOG_DIR, include_invoices=False):
+    """Matcher first, original search unchanged when the matcher finds nothing."""
+    from App.invoicing.product_matcher import rank_products
+    index = catalog(directory)
+    items = index['items']
+    if include_invoices:
+        keys = {(normalize_mapping_key(row['name']), row['unit'].rstrip('.')) for row in items}
+        items = items + [row for row in invoice_catalog()
+                         if (normalize_mapping_key(row['name']), row['unit'].rstrip('.')) not in keys]
+    matches = rank_products(query, items, limit=limit) if query.strip() else []
+    if matches:
+        return dict(items=[{**row, 'score': row['match_score'], 'match_method': 'product_matcher_v1'}
+                           for row in matches], total=len(items), files=index['files'],
+                    errors=index['errors'], match_method='product_matcher_v1')
+    result = default_search_catalog(query, limit=limit, directory=directory, include_invoices=include_invoices)
+    if not result['items']:
+        from App.invoicing.ai_matching import proposals
+        ai = proposals(query,index,limit=limit)
+        if ai['items']:
+            return {**result,'items':ai['items'],'errors':result['errors']+ai['errors'],
+                    'match_method':'ai_matching'}
+        result['errors']=result['errors']+ai['errors']
+    return {**result, 'match_method': 'default_fallback',
+            'items': [{**row, 'match_method': 'default_fallback'} for row in result['items']]}
+
+
 def catalog_named_item(name, unit, directory=CATALOG_DIR):
     index = catalog(directory)
     variants = index["by_name"].get(_name_key(name, unit), [])
@@ -288,14 +314,18 @@ def catalog_item(identity):
 
 
 @lru_cache(maxsize=256)
-def _suggest(query, signature, invoice_signature):
+def _suggest(query, signature, invoice_signature, ai_signature, article=None):
     matches = search_catalog(query, limit=1, include_invoices=True)["items"]
-    return matches[0] if matches and matches[0].get("score", 0) >= 70 else None
+    if not matches and article:
+        from App.invoicing.ai_matching import proposals
+        matches=proposals(query,catalog(),article=article,limit=1)['items']
+    return matches[0] if matches else None
 
 
-def suggest_catalog(query):
+def suggest_catalog(query, article=None):
     from App.invoicing.learned_mapping import TRAINING_DIR
+    from App.invoicing.ai_matching import signature as ai_signature
     signature = tuple((str(path), path.stat().st_mtime_ns, path.stat().st_size)
                       for path in sorted(TRAINING_DIR.glob("case_*/expected.json")))
-    product = _suggest(normalize_mapping_key(query), catalog()["signature"], signature)
+    product = _suggest(query, catalog()["signature"], signature, ai_signature(), article)
     return dict(product) if product else None

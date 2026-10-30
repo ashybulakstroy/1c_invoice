@@ -616,6 +616,10 @@ const VisualSync = {
 (function initReceiptStartScreen(){
   const zone = document.getElementById('drop-zone');
   const pasteButton = document.getElementById('paste-main');
+  const pasteTop = document.getElementById('paste-top');
+  if(pasteTop)pasteTop.addEventListener('click',event=>{
+    event.preventDefault();event.stopPropagation();pasteButton?.click();
+  });
   const overlay = document.getElementById('receipt-waiting-overlay');
   const resultScroll = document.getElementById('output-scroll');
   if(!zone || !pasteButton || !overlay || !resultScroll)return;

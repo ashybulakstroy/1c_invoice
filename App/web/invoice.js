@@ -45,7 +45,7 @@ async function fetchModel(){
 function pickFromRows(model){
   INV.picks=new Map();
   for(const row of model.generation.items){
-    if(row.match_status==='manual'||row.match_status==='remembered'||row.match_status==='suggested'){
+    if(row.match_status==='manual'||row.match_status==='remembered'){
       INV.picks.set(String(row.row_id),{name:row.name,unit:row.unit||'шт',
         quantity:String(row.quantity||'1'),service:!!row.service,
         catalog_id:row.catalog_id||null,code:row.code||null});
@@ -80,7 +80,7 @@ function renderRow(item,index){
   const amount=node('span','inv-row-amount',money(item.source_amount));
   left.append(number,name,amount);
   const chosen=node('div','inv-row-chosen');
-  chosen.append(badge(item.match_status==='unmatched'?'не выбрана':item.match_status,
+  chosen.append(badge(item.match_status==='unmatched'?'Товар 1С не определён':item.match_status==='suggested'?'Примерное соответствие':item.match_status,
                       item.match_status==='unmatched'?'missing':'ok'));
   const known=pickLabel(item);
   if(known)chosen.append(node('span','inv-row-known',known));
@@ -91,7 +91,7 @@ function renderRow(item,index){
   search.type='search';search.placeholder='Поиск в справочнике 1С (название или код)';
   search.setAttribute('aria-label','Поиск 1С для строки '+(item.source_name||''));
   const list=node('div','inv-options');
-  const draw=options=>{list.replaceChildren();for(const option of options.slice(0,10))list.append(optionButton(option));};
+  const draw=options=>{list.replaceChildren();for(const option of options.slice(0,10))list.append(optionButton(option,item));};
   let timer=null;
   search.addEventListener('input',()=>{
     clearTimeout(timer);const query=search.value.trim();
@@ -103,7 +103,7 @@ function renderRow(item,index){
         const data=await response.json();
         const fresh=(data.items||[]).map(entry=>({rowId:item.row_id,sourceQuantity:item.source_quantity,
           origin:'search',code:entry.code,name:entry.name,unit:entry.unit,service:entry.service,
-          stock_quantity:entry.stock_quantity,catalog_id:entry.id,score:entry.score}));
+          stock_quantity:entry.stock_quantity,accounting_price:entry.accounting_price,catalog_id:entry.id,score:entry.score}));
         draw(fresh.length?fresh:invCandidates(item));
       }catch(error){/* поиск недоступен — показанные кандидаты остаются */}
     },300);
@@ -136,16 +136,34 @@ function selectionBar(item,picked){
   return bar;
 }
 
-function optionButton(option){
+function priceComparison(receiptPrice,catalogPrice){
+  const parse=value=>value===null||value===undefined||String(value).trim()===''?NaN:Number(String(value).replace(/\s+/g,'').replace(/,/g,'.'));
+  const receipt=parse(receiptPrice),catalog=parse(catalogPrice);
+  if(!Number.isFinite(receipt)||receipt<0||!Number.isFinite(catalog)||catalog<=0)return null;
+  const percent=Math.abs(receipt-catalog)/catalog*100;
+  return {percent,label:percent<50?'Норма':percent<=100?'Внимание. Налог':'БОЛЬШОЙ НАЛОГ ИПН!!!'};
+}
+
+function optionButton(option,item){
   const button=node('button','inv-option');
   button.type='button';
   button.append(node('span','inv-option-name',option.name||'—'),
                 node('span','inv-option-meta',[
-                  option.origin==='proposal'?'в предложениях':option.origin==='remembered'?'подтверждено ранее':'справочник',
+                  option.origin==='ai_matching'?'ИИ-сопоставление':option.origin==='proposal'?'в предложениях':option.origin==='remembered'?'подтверждено ранее':'справочник',
                   option.code?'код '+option.code:null,
                   option.unit?option.unit:null,
                   option.stock_quantity!=null?('остаток '+option.stock_quantity):'остаток unknown'
                 ].filter(Boolean).join(' · ')));
+  const comparison=priceComparison(item.source_price,option.accounting_price);
+  const detail=node('span','inv-option-meta',
+    'Цена 1С: '+money(option.accounting_price)+' · Цена эл. чека: '+money(item.source_price)+' · '+
+    (comparison?'Разница: '+comparison.percent.toLocaleString('ru-RU',{maximumFractionDigits:2})+'%':'Разница: — (нет цены или цена 1С равна нулю)'));
+  detail.title='Абсолютная разница: |цена эл. чека − цена 1С| / цена 1С × 100%. Сравнение за единицу без пересчёта единиц и НДС. Цена 1С — учётная цена справочника.';
+  if(comparison){
+    detail.append(document.createTextNode(' · '),node('span',
+      'inv-price-status '+(comparison.percent<50?'normal':comparison.percent<=100?'warning':'high'),comparison.label));
+  }
+  button.append(detail);
   button.addEventListener('click',()=>{
     const defaultQuantity=option.service?'1':String(safeQuantity(option));
     INV.picks.set(String(option.rowId),{name:option.name,unit:option.unit||(option.service?'усл':'шт'),
@@ -181,7 +199,7 @@ function renderDocument(model){
   const numbers=node('div','invoice-doc-sums');
   const cell=(label,value)=>{const wrap=node('div','invoice-doc-cell');wrap.append(node('span','',label),node('strong','',value));return wrap;};
   numbers.append(cell('Итого',form.total||money(model.document.total)),
-                 cell('В том числе НДС',form.vat||'—'),
+                 cell((form.vat_label||'НДС').replace(/:$/,''),form.vat||'—'),
                  cell('Прописью',form.amount_words||''));
   const supplier=node('p','invoice-doc-supplier',(issuer.name||'')+((issuer.tax_id)?' · БИН '+issuer.tax_id:''));
   host.append(heading,numbers,supplier);
@@ -190,8 +208,9 @@ function renderDocument(model){
 function renderBlockers(model){
   const reasons=$('invoice-reasons');
   reasons.replaceChildren();
-  for(const reason of model.blocked)reasons.append(node('li','',reason));
-  $('invoice-blockers').hidden=!model.blocked.length;
+  const notes=[...model.blocked,...(model.rounding_notes||[])];
+  for(const reason of notes)reasons.append(node('li','',reason));
+  $('invoice-blockers').hidden=!notes.length;
 }
 
 function renderPdf(model){
@@ -304,6 +323,11 @@ function sync(){
 }
 
 function start(){
+  $('invoice-edit-products').addEventListener('click',()=>{
+    const form=document.querySelector('#invoice-content .invoice-rows');
+    form.scrollIntoView({block:'start',behavior:'instant'});
+    form.querySelector('.inv-search')?.focus({preventScroll:true});
+  });
   $('invoice-save').addEventListener('click',()=>send('selections'));
   $('invoice-preview').addEventListener('click',()=>send('preview'));
   $('invoice-train').addEventListener('click',()=>send('train'));

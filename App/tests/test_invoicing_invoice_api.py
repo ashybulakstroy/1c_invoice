@@ -147,9 +147,9 @@ def test_invoice_requires_completed_job(server):
     status, data = get_json(base + f"/api/jobs/{job_id}/invoice")
     assert status == 200
     assert data["ready"] is False
-    assert any("Выберите номенклатуру 1С" in reason for reason in data["blocked"])
+    assert any("номенклатуру 1С" in reason for reason in data["blocked"])
     rows = {row["source_index"]: row for row in data["generation"]["items"]}
-    assert rows[0]["match_status"] == "unmatched"
+    assert rows[0]["match_status"] in {"unmatched", "suggested"}
     assert data["document"]["number"] == "OCR-1234567890"
 
 
@@ -163,7 +163,8 @@ def test_preview_does_not_persist(server):
     manual = [row for row in preview["generation"]["items"] if row["source_index"] == 0]
     assert manual[0]["match_status"] == "manual"
     status, saved_state = get_json(base + f"/api/jobs/{job_id}/invoice")
-    assert all(row["match_status"] == "unmatched" for row in saved_state["generation"]["items"])
+    assert all(row["match_status"] in {"unmatched", "suggested"} for row in saved_state["generation"]["items"])
+    assert saved_state['selections'] == {}
     assert not (instance.store.jobs[job_id].directory / "invoice_state.json").exists()
 
 
@@ -305,6 +306,8 @@ def test_invoice_allocates_separate_printed_vat_without_changing_receipt():
     model = invoice_model(receipt, FULL_SELECTIONS)
     assert model["ready"], model["blocked"]
     assert sum(Decimal(row["amount"]) for row in model["generation"]["items"]) == Decimal("2610")
+    assert model['generation']['items'][1]['price']=='174.00'
+    assert model['document']['print_form']['vat_label']=='В том числе НДС:'
     assert model["generation"]["vat_amount"] == "360.00"
     assert receipt == before
 
@@ -372,7 +375,7 @@ def test_unfinalized_unmapped_receipt_always_has_pdf(server):
     status, payload = urllib_data(base + f"/api/jobs/{job_id}/invoice.pdf?revision={model['revision']}&token={model['token']}")
     assert status == 200
     text = " ".join(page.extract_text() for page in PdfReader(BytesIO(payload)).pages)
-    assert "Плёнка полиэтиленовая" in text
+    assert "Плёнка полиэтиленовая 100 мкм" not in text  # OCR name must not replace a 1C name.
     assert "Счёт сформирован с замечаниями" not in text
     assert "Выберите номенклатуру 1С" not in text
     assert not (instance.store.jobs[job_id].directory / "invoice_state.json").exists()

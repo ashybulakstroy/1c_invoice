@@ -228,7 +228,7 @@ def source_fingerprint(row):
     return hashlib.sha256(json.dumps(fields, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
-def build_generation(receipt, selections=None, suggest=False, database_id=None):
+def build_generation(receipt, selections=None, suggest=False, database_id=None, *, vat_in_line_amounts=True, preserve_receipt_quantities=False):
     database_id = database_id or database_context()
     learned = apply_training_pairs(receipt, database_id=database_id)
     mapped = {row["source_index"]: row for row in learned["items"]}
@@ -246,7 +246,7 @@ def build_generation(receipt, selections=None, suggest=False, database_id=None):
         if index == len(source_rows) - 1:
             share = vat - allocated
         allocated += share
-        amount = (net[index] + share).quantize(CENT)
+        amount = (net[index] + (share if vat_in_line_amounts else Decimal(0))).quantize(CENT)
         quantity = Decimal(str(source.get("quantity") or 0))
         row = {"name": None, "unit": "", "quantity": str(quantity),
                "price": str((amount / quantity).quantize(CENT, rounding=ROUND_HALF_UP)) if quantity else "0",
@@ -286,8 +286,8 @@ def build_generation(receipt, selections=None, suggest=False, database_id=None):
             row["match_status"] = "unmatched"
         row.update(row_id=row_id, source_index=index, source_name=source_name,
                    source_quantity=str(source["quantity"]), source_price=str(source["price"]), source_amount=str(net[index]))
-        if suggest and not row["name"] and not selection and resolve_source(source)["status"] != "resolved":
-            product = suggest_catalog(source_name)
+        if suggest and not row["name"] and not selection:
+            product = suggest_catalog(source_name, source.get('article'))
             if product:
                 service = product.get("service", product["unit"].rstrip(".") == "усл")
                 quantity = Decimal(1) if service else Decimal(row["quantity"])
@@ -295,7 +295,17 @@ def build_generation(receipt, selections=None, suggest=False, database_id=None):
                            service=service,
                            suggestion_score=product["score"], quantity=str(quantity),
                            price=str((amount / quantity).quantize(UNIT_PRICE_STEP, rounding=ROUND_HALF_UP)) if quantity else "0")
+                row['suggestion_method']=product.get('match_method')
+                if product.get('match_method')=='ai_matching':
+                    row.update({key:product[key] for key in ('ai_source_name','ai_source_article','ai_status','ai_risks','ai_basis','ai_file') if key in product})
                 warnings.append(f"Подтвердите предложенную номенклатуру 1С: {source_name}")
+        if (not vat_in_line_amounts or preserve_receipt_quantities) and not valid_selection:
+            # Automatic catalog/learned identity must not reprice the receipt.
+            # An explicit operator quantity conversion remains a separate action.
+            quantity = Decimal(str(source.get('quantity') or 0))
+            automatic_amount=amount if vat_in_line_amounts else net[index].quantize(CENT)
+            automatic_price=(automatic_amount/quantity).quantize(UNIT_PRICE_STEP,rounding=ROUND_HALF_UP) if vat_in_line_amounts and quantity else Decimal(str(source.get('price') or 0))
+            row.update(quantity=str(quantity), price=str(automatic_price), amount=str(automatic_amount))
         if not row["name"]:
             warnings.append(f"Выберите номенклатуру 1С: {source_name}")
         if Decimal(row["quantity"]) <= 0 or Decimal(row["price"]) <= 0:
@@ -329,10 +339,10 @@ def build_generation(receipt, selections=None, suggest=False, database_id=None):
     if total is None or abs(net_total + vat - Decimal(str(total))) > VAT_TOLERANCE:
         warnings.append("Арифметика исходного чека не сходится")
     if total is not None:
-        difference = Decimal(str(total)) - sum((Decimal(row["amount"]) for row in items), Decimal(0))
+        difference = Decimal(str(total)) - sum((Decimal(row["amount"]) for row in items), Decimal(0)) - (vat if not vat_in_line_amounts else Decimal(0))
         if abs(difference) > VAT_TOLERANCE:
             warnings.append("Сумма позиций 1С отличается от итога чека")
-        elif difference and items and Decimal(items[-1]["quantity"]) > 0:
+        elif difference and items and Decimal(items[-1]["quantity"]) > 0 and vat_in_line_amounts:
             last = items[-1]
             amount = Decimal(last["amount"]) + difference
             last["amount"] = str(amount.quantize(CENT, rounding=ROUND_HALF_UP))
@@ -345,7 +355,7 @@ def build_generation(receipt, selections=None, suggest=False, database_id=None):
             target["amount"] = row["amount"]
             target["price"] = str((Decimal(row["amount"]) / Decimal(target["quantity"])).quantize(UNIT_PRICE_STEP, rounding=ROUND_HALF_UP))
     warnings.extend(receipt.get("warnings", []))
-    return {"items": items, "total": total, "vat_amount": receipt.get("vat_amount"),
+    return {"items": items, "total": total, "vat_amount": receipt.get("vat_amount"), 'vat_in_line_amounts':vat_in_line_amounts,
             "warnings": list(dict.fromkeys(warnings)), "status": "review" if warnings else "applied"}
 
 
@@ -361,7 +371,8 @@ def invoice_document(receipt, generation):
         errors.append("Укажите номер заказа перед печатью счёта")
     document = {"number": f"OCR-{receipt.get('order_number') or ''}", "date": date,
             "issuer": issuer, "items": generation["items"], "total": generation["total"],
-            "vat_amount": generation["vat_amount"], "errors": list(dict.fromkeys(errors)), "ready": not errors}
+            "vat_amount": generation["vat_amount"], 'vat_in_line_amounts':generation.get('vat_in_line_amounts',True),
+            'price_decimal_places':generation.get('price_decimal_places'), "errors": list(dict.fromkeys(errors)), "ready": not errors}
     document["print_form"] = print_fields(document)
     document["token"] = hashlib.sha256(json.dumps(document, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
     return document

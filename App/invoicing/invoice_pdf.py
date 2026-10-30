@@ -14,7 +14,7 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable, KeepTogether
 
-from App.invoicing.invoice_presentation import print_fields
+from App.invoicing.invoice_presentation import print_fields, suggestion_fill
 
 
 def number(value):
@@ -88,15 +88,20 @@ def render_invoice_pdf(document, *, allow_draft=False):
     rows = [[p(label, center) for label in ("№", "Наименование", "Кол-во", "Ед.", "Цена", "Сумма")]]
     for index, row in enumerate(document["items"], 1):
         printed = form["items"][index-1]
-        rows.append([p(index, small), p(row.get("name") or row.get("source_name"), small), p(printed["quantity"], right),
+        rows.append([p(index, small), p(row.get("name"), small), p(printed["quantity"], right),
                      p(row.get("unit")), p(printed["price"], right), p(printed["amount"], right)])
     table = Table(rows, colWidths=[11*mm, 81*mm, 17*mm, 13*mm, 26*mm, 30*mm], repeatRows=1)
+    for index, row in enumerate(document['items'], 1):
+        if not row.get('name'):
+            table.setStyle(TableStyle([('BACKGROUND', (1,index), (1,index), colors.HexColor('#ffd6d6'))]))
+        elif row.get('match_status') == 'suggested':
+            table.setStyle(TableStyle([('BACKGROUND', (1,index), (1,index), colors.HexColor(suggestion_fill(row.get('suggestion_score'))))]))
     table.setStyle(TableStyle([("GRID", (0,0), (-1,-1), .5, colors.black), ("VALIGN", (0,0), (-1,-1), "TOP"),
                                ("BOX", (0,0), (-1,-1), 1, colors.black),
                                ("LEFTPADDING", (0,0), (-1,-1), 2), ("RIGHTPADDING", (0,0), (-1,-1), 2),
                                ("TOPPADDING", (0,0), (-1,-1), 1), ("BOTTOMPADDING", (0,0), (-1,-1), 1)]))
     totals = Table([[p("Итого:", right_bold), p(form["total"], right_bold)],
-                    [p("В том числе НДС:", right_bold), p(form["vat"], right_bold)]], colWidths=[width-30*mm, 30*mm])
+                    [p(form.get('vat_label','В том числе НДС:'), right_bold), p(form["vat"], right_bold)]], colWidths=[width-30*mm, 30*mm])
     totals.setStyle(TableStyle([("RIGHTPADDING", (0,0), (-1,-1), 2), ("TOPPADDING", (0,0), (-1,-1), 1),
                                 ("BOTTOMPADDING", (0,0), (-1,-1), 1)]))
     signature = Table([[p("Исполнитель", bold), "", p(f"/{issuer['executor']}/" if issuer.get("executor") else "", small)]],

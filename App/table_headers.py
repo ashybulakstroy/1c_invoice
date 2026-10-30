@@ -1,4 +1,8 @@
-"""Exclude an aligned row of column labels, including a misread number sign."""
+"""Start receipt contents below the first header confirmed by two columns.
+
+Supports Kazakh/Russian labels, including numeric OCR of the number sign (N8).
+Without a confirmed header no upper content is discarded by this boundary.
+"""
 import re
 import unicodedata
 
@@ -27,12 +31,18 @@ def without_table_headers(lines, layout):
 
     labels = [(line, role(line)) for line in lines if role(line)]
     ignored = set()
+    header_bottoms = []
     for anchor, _ in labels:
         cohort = [(line, label) for line, label in labels if aligned(anchor, line)]
         # Require evidence from two different columns, rather than a product name.
         if len({label for _, label in cohort}) < 2:
             continue
+        header_bottoms.append(max(
+            max((float(point[1]) for point in line.get('eval_box', line.get('box', []))),
+                default=float(line['center'][1])) for line, _ in cohort))
         for line in lines:
             if aligned(anchor, line) and (role(line) or not re.search(r"\d", line["text"])):
                 ignored.add(id(line))
-    return [line for line in lines if id(line) not in ignored]
+    first_header_bottom = min(header_bottoms) if header_bottoms else None
+    return [line for line in lines if id(line) not in ignored and
+            (first_header_bottom is None or float(line['center'][1]) > first_header_bottom)]
