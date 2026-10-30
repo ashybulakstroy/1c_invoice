@@ -252,13 +252,14 @@ function refreshTaskConfirm(){
   if(!TASK){button.hidden=true;note.hidden=true;return;}
   const task=TASK.state||{};
   const revision=INV.model?.revision||null;
-  const confirmed=task.state==='confirmed'||task.state==='applied';
+  const applied=task.state==='applied';
+  const confirmed=task.state==='confirmed'||applied;
   const current=confirmed&&!task.stale_reason&&!!revision&&task.revision===revision;
   button.hidden=false;note.hidden=false;
-  button.disabled=INV.busy||INV.dirty||!INV.model?.ready||current;
-  button.textContent=current?'Подтверждено для 1С':(confirmed||task.stale_reason?'Подтвердить заново':'Подтвердить для 1С');
-  note.className='task-badge'+(current?' done':task.stale_reason?' wait':'');
-  note.textContent=task.state==='applied'?`Применено в 1С, версия ${task.result_version}`:
+  button.disabled=INV.busy||INV.dirty||!INV.model?.ready||current||applied;
+  button.textContent=applied?'Счёт записан в 1С':current?'Подтверждено для 1С':(confirmed||task.stale_reason?'Подтвердить заново':'Подтвердить для 1С');
+  note.className='task-badge'+((current||applied)?' done':task.stale_reason?' wait':'');
+  note.textContent=applied?`Применено в 1С, версия ${task.result_version}`:
     current?`Снимок для 1С: версия ${task.result_version}`:
     task.stale_reason?'Результат изменён — подтвердите заново':
     task.state==='confirmed'?'Счёт изменён после подтверждения':'Ещё не подтверждено для 1С';

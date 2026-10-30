@@ -300,3 +300,57 @@ class ExchangeStore:
             task.stale_reason = reason or "Данные счёта изменились; подтвердите результат заново."
             self._save(task)
             return task
+
+    def link_document(self, task_id: str, document_uuid: str) -> tuple[ExchangeTask, bool]:
+        """Bind an actually recorded 1C document; repeat of the same link is safe."""
+        document_uuid = _text(document_uuid, "document_uuid")
+        with self.lock:
+            task = self.get(task_id)
+            if task.document_uuid:
+                if task.document_uuid.casefold() == document_uuid.casefold():
+                    return task, False
+                raise ExchangeConflict("Задание уже связано с другим документом 1С")
+            task.document_uuid = document_uuid
+            self._save(task)
+            return task, True
+
+    def add_receipt(self, task_id: str, receipt: dict) -> tuple[ExchangeTask, bool]:
+        """Idempotently store an ``applied``/``error`` receipt by ``operation_id``.
+
+        The caller validates the receipt against the frozen result. Repeating
+        the same operation with the same body returns the stored state; the
+        same operation id with another body is a conflict.
+        """
+        operation_id = _text(receipt.get("operation_id"), "operation_id")
+        fingerprint = _text(receipt.get("fingerprint"), "fingerprint", 128)
+        status = receipt.get("status")
+        if status not in {"applied", "error"}:
+            raise ExchangeError("status: ожидается applied или error")
+        with self.lock:
+            task = self.get(task_id)
+            for existing in task.receipts:
+                if existing.get("operation_id", "").casefold() != operation_id.casefold():
+                    continue
+                if existing.get("fingerprint") == fingerprint:
+                    return task, False
+                raise ExchangeConflict(
+                    "Квитанция с этим operation_id уже получена с другим телом")
+            if status == "applied" and task.applied is not None:
+                previous = str(task.applied.get("operation_id") or "")
+                if previous.casefold() != operation_id.casefold():
+                    raise ExchangeConflict(
+                        "Задание уже применено в 1С другой операцией записи")
+            stored = dict(receipt)
+            stored["operation_id"] = operation_id
+            stored["fingerprint"] = fingerprint
+            stored["status"] = status
+            if status == "applied":
+                document_uuid = _text(receipt.get("document_uuid"), "document_uuid")
+                if task.document_uuid and \
+                        task.document_uuid.casefold() != document_uuid.casefold():
+                    raise ExchangeConflict("Квитанция относится к другому документу 1С")
+                task.document_uuid = document_uuid
+                stored["document_uuid"] = document_uuid
+            task.receipts.append(stored)
+            self._save(task)
+            return task, True

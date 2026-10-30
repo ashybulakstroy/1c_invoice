@@ -11,6 +11,7 @@ import threading
 import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from time import perf_counter, time
@@ -311,6 +312,10 @@ def create_server(host=None, port=None, output_dir=None, processor=None, max_upl
                 value = payload.get(key)
                 if value not in (None, "") and str(value).strip().casefold() != expected.casefold():
                     return self.send_json(dict(error=f"Задание относится к другой базе/форме ({key})"), 409)
+            if task.applied is not None:
+                return self.send_json(dict(
+                    error="Результат уже применён в 1С; повторное подтверждение недоступно.",
+                    state=task.state), 409)
             if not task.job_id:
                 return self.send_json(dict(error="Сначала загрузите фото в задание."), 409)
             job = store.get(task.job_id)
@@ -360,28 +365,28 @@ def create_server(host=None, port=None, output_dir=None, processor=None, max_upl
             document["created"] = created
             return self.send_json(document)
 
-        def exchange_result(self, task_id, query):
+        def result_snapshot(self, task_id, query):
+            """Shared checks for JSON/XML results: ``(status, payload)``."""
             try:
                 task = exchange.get(task_id)
             except ExchangeNotFound as error:
-                return self.send_json(dict(error=str(error)), 404)
+                return 404, dict(error=str(error))
             params = parse_qs(query)
             for key, expected in (("database_id", task.database_id),
                                   ("request_id", task.request_id)):
                 value = (params.get(key) or [""])[0].strip()
                 if value and value.casefold() != expected.casefold():
-                    return self.send_json(dict(
-                        error="Задание относится к другой базе/форме 1С. Форму не менять."), 409)
+                    return 409, dict(
+                        error="Задание относится к другой базе/форме 1С. Форму не менять.")
             if task.stale_reason:
-                return self.send_json(dict(
+                return 409, dict(
                     error="Результат изменён после подтверждения. Подтвердите его заново.",
-                    reasons=[task.stale_reason], state=task.state), 409)
+                    reasons=[task.stale_reason], state=task.state)
             if task.confirmed_at is None or not task.result.get("checksum"):
-                return self.send_json(dict(error="Результат ещё не подтверждён.",
-                                           state=task.state,
-                                           ui_url=task_document(task)["ui_url"]), 202)
+                return 202, dict(error="Результат ещё не подтверждён.",
+                                 state=task.state, ui_url=task_document(task)["ui_url"])
             job = store.get(task.job_id) if task.job_id else None
-            if job is not None:
+            if job is not None and task.applied is None:
                 current = None
                 with job.condition:
                     if job.status == "done" and job.result:
@@ -393,15 +398,152 @@ def create_server(host=None, port=None, output_dir=None, processor=None, max_upl
                 if current and task.input_revision and current != task.input_revision:
                     exchange.invalidate_job(
                         job.id, "Данные счёта изменились после подтверждения; подтвердите результат заново.")
-                    return self.send_json(dict(
+                    return 409, dict(
                         error="Результат изменён после подтверждения. Подтвердите его заново.",
-                        reasons=["Изменились чек, связи номенклатуры или справочник 1С."]), 409)
+                        reasons=["Изменились чек, связи номенклатуры или справочник 1С."])
             snapshot = exchange.load_result(task)
             if (snapshot is None or snapshot.get("checksum") != task.result.get("checksum")
                     or contract.checksum(snapshot) != snapshot.get("checksum")):
+                return 409, dict(
+                    error="Снимок результата не найден или повреждён. Подтвердите результат заново.")
+            return 200, snapshot
+
+        def exchange_result(self, task_id, query):
+            status, payload = self.result_snapshot(task_id, query)
+            return self.send_json(payload, status)
+
+        def exchange_result_xml(self, task_id, query):
+            status, payload = self.result_snapshot(task_id, query)
+            if status != 200:
+                return self.send_json(payload, status)
+            return self.send_data(contract.to_xml(payload), "application/xml; charset=utf-8")
+
+        def read_small_json(self, limit=65536, label="запроса"):
+            """Read a small JSON object; returns ``(payload, (status, error))``."""
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                length = 0
+            if length < 0:
+                length = 0
+            if length > limit:
+                self.close_connection = True
+                return None, (413, dict(error=f"Слишком большой {label}"))
+            data = self.rfile.read(length) if length else b"{}"
+            if len(data) != length:
+                return None, (400, dict(error=f"{label.capitalize()} загружен не полностью"))
+            try:
+                payload = json.loads(data or b"{}")
+            except (ValueError, TypeError):
+                return None, (400, dict(error=f"{label.capitalize()} должен быть корректным JSON"))
+            if not isinstance(payload, dict):
+                return None, (400, dict(error=f"{label.capitalize()} должен быть JSON-объектом"))
+            return payload, None
+
+        def exchange_document_link(self, task_id):
+            payload, error = self.read_small_json(label="запроса привязки документа")
+            if error:
+                return self.send_json(error[1], error[0])
+            try:
+                task = exchange.get(task_id)
+            except ExchangeNotFound as not_found:
+                return self.send_json(dict(error=str(not_found)), 404)
+            for key, expected in (("database_id", task.database_id),
+                                  ("request_id", task.request_id)):
+                value = payload.get(key)
+                if value not in (None, "") and str(value).strip().casefold() != expected.casefold():
+                    return self.send_json(dict(error=f"Задание относится к другой базе/форме ({key})"), 409)
+            document_uuid = payload.get("document_uuid")
+            if not isinstance(document_uuid, str) or not document_uuid.strip():
+                return self.send_json(dict(error="document_uuid: требуется идентификатор документа 1С"), 400)
+            try:
+                task, linked = exchange.link_document(task_id, document_uuid)
+            except ExchangeConflict as conflict:
+                return self.send_json(dict(error=str(conflict)), 409)
+            except ExchangeError as invalid:
+                return self.send_json(dict(error=str(invalid)), 400)
+            document = task_document(task, self.base_url())
+            document["linked"] = linked
+            return self.send_json(document)
+
+        def exchange_import_receipt(self, task_id):
+            payload, error = self.read_small_json(262144, "запроса квитанции")
+            if error:
+                return self.send_json(error[1], error[0])
+            try:
+                task = exchange.get(task_id)
+            except ExchangeNotFound as not_found:
+                return self.send_json(dict(error=str(not_found)), 404)
+            database = payload.get("database_id")
+            request = payload.get("request_id")
+            operation = payload.get("operation_id")
+            if not all(isinstance(value, str) and value.strip()
+                       for value in (database, request, operation)):
                 return self.send_json(dict(
-                    error="Снимок результата не найден или повреждён. Подтвердите результат заново."), 409)
-            return self.send_json(snapshot)
+                    error="database_id, request_id и operation_id обязательны"), 400)
+            if database.strip().casefold() != task.database_id.casefold() or \
+                    request.strip().casefold() != task.request_id.casefold():
+                return self.send_json(dict(error="Квитанция относится к другой базе/форме 1С"), 409)
+            status = payload.get("status")
+            if status not in {"applied", "error"}:
+                return self.send_json(dict(error="status: ожидается applied или error"), 400)
+            version = payload.get("result_version")
+            checksum = payload.get("checksum")
+            document_uuid = payload.get("document_uuid")
+            if status == "applied":
+                if not isinstance(version, int) or isinstance(version, bool) or version <= 0:
+                    return self.send_json(dict(error="result_version: требуется целое число версии"), 400)
+                if not isinstance(checksum, str) or not checksum.strip():
+                    return self.send_json(dict(error="checksum: требуется контрольная сумма"), 400)
+                if not isinstance(document_uuid, str) or not document_uuid.strip():
+                    return self.send_json(dict(error="document_uuid: требуется идентификатор документа 1С"), 400)
+                if task.stale_reason:
+                    return self.send_json(dict(
+                        error="Результат изменён после подтверждения; квитанция не принята.",
+                        reasons=[task.stale_reason]), 409)
+                if task.confirmed_at is None or not task.result.get("checksum"):
+                    return self.send_json(dict(error="Результат ещё не подтверждён."), 409)
+                if version != task.result_version:
+                    return self.send_json(dict(
+                        error=f"Квитанция относится к версии {version}, подтверждена версия {task.result_version}."), 409)
+                if checksum.strip().casefold() != task.result["checksum"].casefold():
+                    return self.send_json(dict(error="Контрольная сумма не совпадает с подтверждённым снимком."), 409)
+            elif isinstance(version, bool) or (version is not None and not isinstance(version, int)):
+                return self.send_json(dict(error="result_version: требуется целое число версии"), 400)
+            document_number = payload.get("document_number")
+            message = payload.get("message")
+            warnings = payload.get("stock_warnings")
+            for value, name, limit in ((document_number, "document_number", 200),
+                                       (message, "message", 1000)):
+                if value is not None and (not isinstance(value, str) or len(value) > limit):
+                    return self.send_json(dict(error=f"{name}: некорректное значение"), 400)
+            if warnings is not None and (not isinstance(warnings, list) or len(warnings) > 200):
+                return self.send_json(dict(error="stock_warnings: ожидается список"), 400)
+            receipt = {
+                "operation_id": operation.strip(),
+                "status": status,
+                "database_id": database.strip(),
+                "request_id": request.strip(),
+                "document_uuid": document_uuid.strip() if isinstance(document_uuid, str) and document_uuid.strip() else None,
+                "result_version": version,
+                "checksum": checksum.strip() if isinstance(checksum, str) else None,
+                "document_number": document_number.strip() if isinstance(document_number, str) and document_number.strip() else None,
+                "message": message.strip() if isinstance(message, str) and message.strip() else None,
+                "stock_warnings": warnings or [],
+                "received_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+                "fingerprint": contract.fingerprint(payload),
+            }
+            try:
+                task, created = exchange.add_receipt(task_id, receipt)
+            except ExchangeConflict as conflict:
+                return self.send_json(dict(error=str(conflict)), 409)
+            except ExchangeError as invalid:
+                return self.send_json(dict(error=str(invalid)), 400)
+            document = task_document(task, self.base_url())
+            document["created"] = created
+            document["operation_id"] = operation.strip()
+            document["receipt_status"] = status
+            return self.send_json(document)
 
         def do_GET(self):
             parts = urlparse(self.path)
@@ -426,8 +568,10 @@ def create_server(host=None, port=None, output_dir=None, processor=None, max_upl
                     except ExchangeNotFound as error:
                         return self.send_json(dict(error=str(error)), 404)
                     return self.send_json(task_document(task, self.base_url()))
-                result_route = re.fullmatch(r"/tasks/([a-f0-9]{32})/result", path)
+                result_route = re.fullmatch(r"/tasks/([a-f0-9]{32})/result(\.xml)?", path)
                 if result_route:
+                    if result_route[2]:
+                        return self.exchange_result_xml(result_route[1], parts.query)
                     return self.exchange_result(result_route[1], parts.query)
                 route = re.fullmatch(r"/tasks/([a-f0-9]{32})", path)
                 if route:
@@ -541,6 +685,12 @@ def create_server(host=None, port=None, output_dir=None, processor=None, max_upl
             confirm_route = re.fullmatch(r"/tasks/([a-f0-9]{32})/confirm", parts.path)
             if confirm_route:
                 return self.exchange_confirm(confirm_route[1])
+            link_route = re.fullmatch(r"/tasks/([a-f0-9]{32})/document-link", parts.path)
+            if link_route:
+                return self.exchange_document_link(link_route[1])
+            receipt_route = re.fullmatch(r"/tasks/([a-f0-9]{32})/import-receipt", parts.path)
+            if receipt_route:
+                return self.exchange_import_receipt(receipt_route[1])
             edit_route = re.fullmatch(r"/api/jobs/([a-f0-9]{32})/edits", parts.path)
             invoice_route = re.fullmatch(r"/api/jobs/([a-f0-9]{32})/invoice/(preview|preview-pdf|selections|train)", parts.path)
             if parts.path != "/api/jobs" and edit_route is None and invoice_route is None:

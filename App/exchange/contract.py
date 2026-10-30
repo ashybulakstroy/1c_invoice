@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 
@@ -36,6 +37,11 @@ def checksum(payload: dict) -> str:
     """Checksum of the snapshot body; the ``checksum`` field itself is ignored."""
     body = {key: value for key, value in payload.items() if key != "checksum"}
     return hashlib.sha256(_canonical(body)).hexdigest()
+
+
+def fingerprint(payload: dict) -> str:
+    """Canonical fingerprint of an arbitrary JSON body (receipt idempotency)."""
+    return hashlib.sha256(_canonical(payload)).hexdigest()
 
 
 def input_revision(receipt: dict, selections: dict | None = None) -> str:
@@ -178,3 +184,32 @@ def build_snapshot(task, model: dict, receipt: dict, version: int, now: float | 
     }
     snapshot["checksum"] = checksum(snapshot)
     return snapshot
+
+
+def _xml_value(parent, key: str, value) -> None:
+    element = ET.SubElement(parent, key)
+    if value is None:
+        element.set("nil", "true")
+    elif key == "conditions" and isinstance(value, dict):
+        # The 1C side expects conditions as JSON text in a single element.
+        element.text = json.dumps(value, ensure_ascii=False, sort_keys=True)
+    elif isinstance(value, dict):
+        for child_key, child in value.items():
+            _xml_value(element, str(child_key), child)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _xml_value(element, "item", item)
+    elif isinstance(value, bool):
+        element.text = "true" if value else "false"
+    else:
+        element.text = str(value)
+
+
+def to_xml(snapshot: dict) -> bytes:
+    """XML form of the same snapshot; semantics of amounts are unchanged."""
+    root = ET.Element("TorgsoftInvoice",
+                      {"schemaVersion": snapshot.get("schema_version") or SCHEMA_VERSION})
+    for key, value in snapshot.items():
+        _xml_value(root, str(key), value)
+    ET.indent(root, space="  ")
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True)

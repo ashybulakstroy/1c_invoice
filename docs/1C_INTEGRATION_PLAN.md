@@ -176,25 +176,29 @@ M2–M6 — по плану ниже. Код стороны 1С ещё не со
 | **M1. Ядро обмена** | `App/exchange/`: store, contract; маршруты `POST/GET /tasks`, `/api/health`; тесты идемпотентности | `POST /tasks` дважды → одно задание |
 | **M2. Фото и страница задания** | `POST /tasks/{id}/photos` (multipart), привязка к `JobStore`, страница `/tasks/{id}/ui` + режим в `app.js` | Фото из 1С-задания распознаётся; повтор другого фото → 409 |
 | **M3. Подтверждение и результат** | `confirm`, `result` JSON 1.1, версии, checksum, 202/200/409; инвалидация при правках | ✅ Снимок неизменяем; после правок без confirm → 409 |
-| **M4. Квитанции и XML** | `import-receipt` (`applied`/`error`), `document-link`, `result.xml`, восстановление после рестарта | Повтор той же квитанции безопасен; смена тела → 409 |
+| **M4. Квитанции и XML** | `import-receipt` (`applied`/`error`), `document-link`, `result.xml`, восстановление после рестарта | ✅ Повтор той же квитанции безопасен; смена тела → 409; XML из того же снимка |
 | **M5. Расширение 1С** | По `docs/1C_EXTENSION_SPEC.md` на основе `OCRClient.bsl`/`OCRFormCommands.bsl`: команды, видимость, заполнение без записи, дефицит, регистр, applied | Сквозной сценарий на тестовой базе 3.0.75.1 |
 | **M6. Пилот** | Реальные чеки, сбои сети, повторные нажатия, мобильный браузер | Подписанный чек-лист приёмки |
 
-Текущий статус (30.10.2026): **M1–M3 выполнены** (M3 — в объёме JSON;
-XML-выдача перенесена в M4). Создан `App/exchange/` (`store.py`,
-`multipart.py`, `contract.py`), маршруты `POST /tasks`, `GET /tasks/{id}`,
-`POST /tasks/{id}/photos`, `POST /tasks/{id}/confirm`,
-`GET /tasks/{id}/result`, страница `/tasks/{task_id}/ui` и
+Текущий статус (30.10.2026): **M1–M4 выполнены**. Создан `App/exchange/`
+(`store.py`, `multipart.py`, `contract.py`), маршруты `POST /tasks`,
+`GET /tasks/{id}`, `POST /tasks/{id}/photos`, `POST /tasks/{id}/confirm`,
+`GET /tasks/{id}/result` и `result.xml`, `POST /tasks/{id}/document-link`,
+`POST /tasks/{id}/import-receipt`, страница `/tasks/{task_id}/ui` и
 `GET /tasks/{task_id}/ui/state`, `GET /api/health` с признаком `exchange`.
 Сетевая аутентификация не используется по решению пользователя.
 Подтверждение фиксирует `result-vN.json` с каноническим checksum; правка
-чека, сохранение связей и обучение инвалидируют его. Тесты:
-`test_exchange_store.py`, `test_exchange_api.py`, `test_exchange_photos.py`,
-`test_exchange_confirm.py` — 23 PASS; существующие тесты веб-сервера и
-счёта — без регрессий (полный прогон: 274 PASS, 13 прежних FAIL из-за
+чека, сохранение связей и обучение инвалидируют его. Квитанция `applied`
+привязывает записанный документ и переводит задание в терминальное
+состояние; повтор идемпотентен по `operation_id`, `error` документ не
+привязывает. Привязка и квитанции восстанавливаются из `task.json` после
+рестарта. Тесты: `test_exchange_store.py`, `test_exchange_api.py`,
+`test_exchange_photos.py`, `test_exchange_confirm.py`,
+`test_exchange_receipts.py` — 34 PASS; существующие тесты веб-сервера и
+счёта — без регрессий (полный прогон: 285 PASS, 13 прежних FAIL из-за
 отсутствующих `data/in_data/*` и одного расхождения справочника).
 
-После M4 сквозная проверка возможна без 1С (curl/Postman + страница);
+Сквозная проверка без 1С выполнена (`test_exchange_receipts.py`);
 M5 требует доступа к тестовой базе и платформы 8.3.23 (в среде разработки
 её нет — приёмка выполняется на стороне пользователя).
 
@@ -208,10 +212,12 @@ M5 требует доступа к тестовой базе и платфор�
   `App/exchange/contract.py` из `invoice_model()` без повторного OCR.
 - **`App/web/index.html`, `app.js`, `invoice.js`:** режим задания, кнопка
   «Подтвердить для 1С», статусы; без ломки текущего сценария.
-- **`.env`:** `OCR_EXCHANGE_DATABASE_ID` (или существующий
-  `TORGSOFT_CATALOG_DATABASE_ID`). Ключ API не используется.
-- **`Data/exchange/`** (или `web_outputs/exchange/`): `task.json`,
-  `result-vN.json`, `result-vN.xml`, журнал квитанций.
+- **`.env`:** `database_id` приходит от 1С в задании; для локального
+  каталога — `TORGSOFT_CATALOG_DATABASE_ID` (по умолчанию `local`). Ключ API
+  не используется.
+- **`web_outputs/exchange/`:** `<task_id>/task.json` (состояние, привязка,
+  квитанции) и `result-vN.json`; XML формируется из зафиксированного JSON
+  при запросе и отдельно не хранится.
 - **Документация:** обновить `docs/1C_EXTENSION_SPEC.md` по итогам M0,
   `docs/INVOICE_IMPORT_PLAN.md` (этап 6 → фактический статус).
 

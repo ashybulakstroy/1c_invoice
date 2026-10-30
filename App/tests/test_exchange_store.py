@@ -111,3 +111,76 @@ def test_confirm_versions_result_files_and_invalidation(tmp_path):
     with pytest.raises(ExchangeConflict):
         restarted.confirm(task.task_id, "r3", "input-3",
                           lambda version: {"revision": "other", "checksum": "e" * 64})
+
+
+def test_link_document_is_idempotent_and_survives_restart(tmp_path):
+    store = ExchangeStore(tmp_path)
+    task, _ = store.create(DATABASE, REQUEST)
+    linked, created = store.link_document(task.task_id, DOCUMENT)
+    assert created and linked.document_uuid == DOCUMENT
+    same, created = store.link_document(task.task_id, DOCUMENT.upper())
+    assert not created and same.document_uuid == DOCUMENT
+    with pytest.raises(ExchangeConflict):
+        store.link_document(task.task_id, "другой-документ")
+    with pytest.raises(ExchangeError):
+        store.link_document(task.task_id, "")
+
+    restarted = ExchangeStore(tmp_path)
+    assert restarted.get(task.task_id).document_uuid == DOCUMENT
+
+
+def test_applied_receipt_is_idempotent_and_restores_after_restart(tmp_path):
+    store = ExchangeStore(tmp_path)
+    task, _ = store.create(DATABASE, REQUEST)
+    store.bind_job(task.task_id, "a" * 32)
+    task, _ = store.confirm(
+        task.task_id, "r1", "input-1",
+        lambda version: {"revision": "r1", "result_version": version,
+                         "checksum": "c" * 64,
+                         "confirmed_at": "2026-10-30T10:00:00Z",
+                         "items": [], "total": "0.00"})
+    receipt = {"operation_id": "op-1", "fingerprint": "f" * 64, "status": "applied",
+               "document_uuid": DOCUMENT, "result_version": 1, "checksum": "c" * 64,
+               "received_at": "2026-10-30T10:01:00Z"}
+    task, created = store.add_receipt(task.task_id, receipt)
+    assert created and task.state == "applied" and task.document_uuid == DOCUMENT
+    assert task_document(task)["applied"] is True
+    same, created = store.add_receipt(task.task_id, dict(receipt))
+    assert not created and len(same.receipts) == 1
+    with pytest.raises(ExchangeConflict):
+        store.add_receipt(task.task_id, dict(receipt, fingerprint="d" * 64,
+                                             checksum="d" * 64))
+    with pytest.raises(ExchangeConflict):
+        store.add_receipt(task.task_id, dict(receipt, operation_id="op-2"))
+    with pytest.raises(ExchangeConflict):
+        store.add_receipt(task.task_id, dict(receipt, operation_id="op-2",
+                                             document_uuid="другой-документ"))
+    linked, _ = store.create(DATABASE, "another-request")
+    store.link_document(linked.task_id, DOCUMENT)
+    with pytest.raises(ExchangeConflict):
+        store.add_receipt(linked.task_id, dict(receipt, operation_id="op-4",
+                                               document_uuid="другой-документ"))
+    with pytest.raises(ExchangeError):
+        store.add_receipt(task.task_id, dict(receipt, operation_id="op-3",
+                                             status="imported"))
+
+    restarted = ExchangeStore(tmp_path)
+    loaded = restarted.get(task.task_id)
+    assert loaded.state == "applied" and loaded.applied["operation_id"] == "op-1"
+    assert loaded.document_uuid == DOCUMENT and loaded.applied["checksum"] == "c" * 64
+    assert restarted.invalidate_job("a" * 32, "Чек изменён") is None
+    assert loaded.stale_reason is None
+
+
+def test_error_receipt_does_not_apply_or_bind_document(tmp_path):
+    store = ExchangeStore(tmp_path)
+    task, _ = store.create(DATABASE, REQUEST)
+    error = {"operation_id": "err-1", "fingerprint": "e" * 64, "status": "error",
+             "message": "Не удалось записать"}
+    task, created = store.add_receipt(task.task_id, error)
+    assert created and task.state == "waiting_photo" and task.applied is None
+    assert task.document_uuid is None and task.receipts[0]["message"] == "Не удалось записать"
+    with pytest.raises(ExchangeConflict):
+        store.add_receipt(task.task_id, dict(error, fingerprint="f" * 64,
+                                             message="Другая ошибка"))
+    assert len(ExchangeStore(tmp_path).get(task.task_id).receipts) == 1
