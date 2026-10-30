@@ -20,6 +20,8 @@ import cv2
 from pydantic import ValidationError
 
 from App.ocr_catalog_eval import PASS_SIMILARITY, ROOT
+from App.exchange import (EXCHANGE_KEY_HEADER, ExchangeAuth, ExchangeConflict, ExchangeError,
+                          ExchangeNotFound, ExchangeStore, task_document)
 from App.web_pipeline import ReceiptPipeline
 from App.receipt_editing import apply_edit, save_receipt, update_receipt
 from App.server_config import ServerSettings, server_settings
@@ -173,12 +175,16 @@ class ReceiptHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
 
-def create_server(host=None, port=None, output_dir=None, processor=None, max_upload=20*1024*1024):
+def create_server(host=None, port=None, output_dir=None, processor=None, max_upload=20*1024*1024,
+                  exchange_key_path=None):
     if host is None or port is None:
         settings = server_settings()
         host = settings.host if host is None else host
         port = settings.port if port is None else port
-    store = JobStore(output_dir or ROOT / "web_outputs", processor, max_upload)
+    root_dir = Path(output_dir) if output_dir is not None else ROOT / "web_outputs"
+    store = JobStore(root_dir, processor, max_upload)
+    exchange = ExchangeStore(root_dir / "exchange")
+    exchange_auth = ExchangeAuth(exchange_key_path)
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -200,6 +206,45 @@ def create_server(host=None, port=None, output_dir=None, processor=None, max_upl
         def send_json(self, data, status=200):
             self.send_data(json.dumps(data, ensure_ascii=False).encode(), "application/json; charset=utf-8", status)
 
+        def authorized(self):
+            return exchange_auth.check(self.headers.get(EXCHANGE_KEY_HEADER))
+
+        def base_url(self):
+            host = (self.headers.get("Host") or "").strip()
+            if not host or len(host) > 200:
+                host = f"127.0.0.1:{self.server.server_port}"
+            return "http://" + host
+
+        def exchange_create(self):
+            if not self.authorized():
+                return self.send_json(dict(error="Требуется ключ API обмена"), 401)
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                length = 0
+            if length <= 0:
+                return self.send_json(dict(error="Пустой запрос задания"), 400)
+            if length > 65536:
+                self.close_connection = True
+                return self.send_json(dict(error="Слишком большой запрос задания"), 413)
+            data = self.rfile.read(length)
+            if len(data) != length:
+                return self.send_json(dict(error="Запрос задания загружен не полностью"), 400)
+            try:
+                payload = json.loads(data)
+                if not isinstance(payload, dict):
+                    raise ExchangeError("Тело задания должно быть JSON-объектом")
+                task, created = exchange.create(payload.get("database_id"),
+                                                payload.get("request_id"),
+                                                payload.get("document_uuid"))
+            except ExchangeConflict as error:
+                return self.send_json(dict(error=str(error)), 409)
+            except ExchangeError as error:
+                return self.send_json(dict(error=str(error)), 400)
+            except (ValueError, TypeError):
+                return self.send_json(dict(error="Тело задания должно быть корректным JSON"), 400)
+            return self.send_json(task_document(task, self.base_url()), 201 if created else 200)
+
         def do_GET(self):
             parts = urlparse(self.path)
             path = unquote(parts.path)
@@ -209,7 +254,19 @@ def create_server(host=None, port=None, output_dir=None, processor=None, max_upl
                 mime = {"html":"text/html", "js":"text/javascript", "css":"text/css"}[filename.split(".")[-1]]
                 return self.send_data((STATIC / filename).read_bytes(), mime+"; charset=utf-8")
             if path == "/api/health":
-                return self.send_json(dict(ok=True, pass_similarity=PASS_SIMILARITY, max_upload_bytes=store.max_upload))
+                return self.send_json(dict(ok=True, pass_similarity=PASS_SIMILARITY, max_upload_bytes=store.max_upload,
+                                           exchange=True))
+            if path.startswith("/tasks"):
+                if not self.authorized():
+                    return self.send_json(dict(error="Требуется ключ API обмена"), 401)
+                route = re.fullmatch(r"/tasks/([a-f0-9]{32})", path)
+                if route:
+                    try:
+                        task = exchange.get(route[1])
+                    except ExchangeNotFound as error:
+                        return self.send_json(dict(error=str(error)), 404)
+                    return self.send_json(task_document(task, self.base_url()))
+                return self.send_json(dict(error="Адрес не найден"), 404)
             if path == "/api/catalog":
                 query = parse_qs(parts.query).get("q", [""])[0]
                 return self.send_json(dict(items=store.pipeline.search_catalog(query)))
@@ -304,6 +361,8 @@ def create_server(host=None, port=None, output_dir=None, processor=None, max_upl
 
         def do_POST(self):
             parts = urlparse(self.path)
+            if parts.path == "/tasks":
+                return self.exchange_create()
             edit_route = re.fullmatch(r"/api/jobs/([a-f0-9]{32})/edits", parts.path)
             invoice_route = re.fullmatch(r"/api/jobs/([a-f0-9]{32})/invoice/(preview|preview-pdf|selections|train)", parts.path)
             if parts.path != "/api/jobs" and edit_route is None and invoice_route is None:

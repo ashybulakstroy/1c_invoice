@@ -21,7 +21,8 @@ def server(tmp_path):
         result = dict(rows=[], product_count=0)
         job.json_file("receipt.json", result)
         return result
-    instance = create_server("127.0.0.1", 0, tmp_path, process, max_upload=1024)
+    instance = create_server("127.0.0.1", 0, tmp_path, process, max_upload=1024,
+                             exchange_key_path=tmp_path / "network_api_key.txt")
     thread = threading.Thread(target=instance.serve_forever, daemon=True)
     thread.start()
     yield instance, f"http://127.0.0.1:{instance.server_port}"
