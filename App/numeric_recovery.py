@@ -261,6 +261,15 @@ def recover_numeric_receipt(receipt, image, layout, aligned_lines, recognize, *,
                  initial_total_status=initial_calc['status'],
                  vat_attempts=[], all_numeric_attempts=[],
                  vat_triggered=False, total_triggered=False, applied=[], warnings=[])
+    # Isolated recovery of absent prices before the existing fallback. Do not
+    # replace valid prices or derive a number from the receipt total.
+    from App.selective_price_ocr import recover_missing_prices
+    current, price_report = recover_missing_prices(
+        current, image, layout, recognize, ocr_lock=ocr_lock,
+        max_images=cfg['max_images'])
+    audit['selective_price'] = price_report
+    audit['applied'].extend(price_report['applied'])
+    _, vat = _clean_state(current)
 
     def task_for(row, field):
         bounds = _crop_cell(image, layout, row, field)
