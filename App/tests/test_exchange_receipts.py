@@ -295,8 +295,8 @@ def test_result_xml_status_codes_and_foreign_identifiers(server):
     assert status == 200
     url = f"{base}/tasks/{task['task_id']}/result.xml"
     status, content_type, body = fetch(url)
-    assert status == 409 and content_type == "application/json"
-    assert json.loads(body)["state"] == "review"
+    assert status == 200 and content_type == "application/xml"
+    assert ET.fromstring(body).findtext("result_version") == "2"
 
 
 def test_xml_conditions_and_fingerprint_are_canonical():

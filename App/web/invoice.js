@@ -255,14 +255,14 @@ function refreshTaskConfirm(){
   const applied=task.state==='applied';
   const confirmed=task.state==='confirmed'||applied;
   const current=confirmed&&!task.stale_reason&&!!revision&&task.revision===revision;
-  button.hidden=false;note.hidden=false;
+  button.hidden=true;note.hidden=false;
   button.disabled=INV.busy||INV.dirty||!INV.model?.ready||current||applied;
   button.textContent=applied?'Счёт записан в 1С':current?'Подтверждено для 1С':(confirmed||task.stale_reason?'Подтвердить заново':'Подтвердить для 1С');
   note.className='task-badge'+((current||applied)?' done':task.stale_reason?' wait':'');
   note.textContent=applied?`Применено в 1С, версия ${task.result_version}`:
     current?`Снимок для 1С: версия ${task.result_version}`:
-    task.stale_reason?'Результат изменён — подтвердите заново':
-    task.state==='confirmed'?'Счёт изменён после подтверждения':'Ещё не подтверждено для 1С';
+    task.stale_reason?'Обновлённый счёт доступен для получения в 1С':
+    task.state==='confirmed'?'Обновлённый счёт доступен для получения в 1С':'Сформированный счёт можно получить в 1С';
 }
 
 async function confirmFor1C(){

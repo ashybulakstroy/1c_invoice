@@ -80,9 +80,9 @@ def _factor_text(row: dict, quantity: Decimal | None, source: Decimal | None) ->
     return format(number.normalize(), "f")
 
 
-def _target(row: dict) -> dict | None:
+def _target(row: dict, allow_missing=False) -> dict | None:
     """One 1C target row; ``None`` means the invoice row has no 1C product."""
-    if not row.get("name"):
+    if not row.get("name") and not allow_missing:
         return None
     service = bool(row.get("service"))
     quantity = _decimal(row.get("quantity"))
@@ -91,7 +91,7 @@ def _target(row: dict) -> dict | None:
         "code": row.get("code"),
         "uuid": None,
         "catalog_id": row.get("catalog_id"),
-        "name": row["name"],
+        "name": row.get("name") or "",
         "unit": row.get("unit") or ("усл" if service else ""),
         "service": service,
         "quantity_mode": row.get("quantity_mode") or ("service" if service else "factor"),
@@ -137,26 +137,23 @@ def build_snapshot(task, model: dict, receipt: dict, version: int, now: float | 
     """JSON 1.1 snapshot for one confirmation of ``task``.
 
     ``model`` is the current ``invoice_service.invoice_model`` result; the
-    caller must have checked ``finalized``, ``validation_status`` and ``ready``.
+    caller supplies a formed invoice; operator confirmation is not required.
     """
     receipt_snapshot = snapshot_from_receipt(receipt)
     receipt_lines = {str(line.row_id): line for line in receipt_snapshot.lines}
     items = []
     for row in model["generation"]["items"]:
         status = row.get("match_status")
-        if status not in CONFIRMED_TARGETS:
-            raise ValueError(f"Строка {row.get('row_id')} не подтверждена для 1С.")
-        target = _target(row)
-        if target is None:
-            raise ValueError(f"Строка {row.get('row_id')} не имеет номенклатуры 1С.")
+        target = _target(row, allow_missing=True)
         row_id = str(row.get("row_id"))
         items.append({
             "row_id": row_id,
+            "match_status": status,
             "photo_id": task.job_id,
             "source": _source(row, receipt_lines.get(row_id)),
             "target": target,
-            "allowed_targets": _allowed_targets(row),
-            "selection_policy": "explicit" if status == "manual" else "approved_alternatives",
+            "allowed_targets": [target] if status not in CONFIRMED_TARGETS else _allowed_targets(row),
+            "selection_policy": "approved_alternatives" if status in {"remembered", "learned"} else "explicit",
         })
     document = model["document"]
     moment = time.time() if now is None else now

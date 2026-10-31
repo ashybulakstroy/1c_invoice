@@ -476,7 +476,7 @@ async function upload(file){
   const preview=new Image();preview.src=state.blob;preview.onload=()=>{if(token===state.token&&!state.assets.has('original'))addArtifact({key:'original',role:'original',title:'Исходное фото',subtitle:file.name,url:preview.src,width:preview.naturalWidth,height:preview.naturalHeight});};
   $('process-title').textContent='Загружаем фотографию';$('process-subtitle').textContent=file.name;
   try{
-    const response=TASK?postTaskPhoto(file):fetch('/api/jobs?filename='+encodeURIComponent(file.name||'clipboard.png'),{method:'POST',headers:{'Content-Type':file.type||'application/octet-stream'},body:file});
+    const response=await (TASK?postTaskPhoto(file):fetch('/api/jobs?filename='+encodeURIComponent(file.name||'clipboard.png'),{method:'POST',headers:{'Content-Type':file.type||'application/octet-stream'},body:file}));
     const job=await response.json();if(!response.ok)throw Error(job.error||'Не удалось загрузить фотографию');if(token!==state.token)return;
     state.job=job.job_id||job.id;if(TASK)updateTaskBadge(job);window.ReceiptUploadGate?.accepted(token);try{localStorage.setItem('receipt-last-job',state.job);}catch{}listen(state.job,token);
   }catch(error){if(token===state.token)showError(error.message||'Не удалось связаться с сервером');}
@@ -485,7 +485,7 @@ function postTaskPhoto(file){
   const form=new FormData();form.append('file',file,file.name||'clipboard.png');
   return fetch(`/tasks/${TASK}/photos`,{method:'POST',body:form});
 }
-const TASK_LABELS={waiting_photo:'ожидает фото',review:'проверка чека',confirmed:'подтверждено для 1С',applied:'применено в 1С'};
+const TASK_LABELS={waiting_photo:'ожидает фото',review:'проверка чека',confirmed:'готово для 1С',applied:'применено в 1С'};
 let TASK_STATE=null;
 function updateTaskBadge(task){
   const badge=$('task-badge');

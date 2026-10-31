@@ -89,7 +89,7 @@ def test_automatic_learned_service_cannot_replace_receipt_price(monkeypatch):
                 vat_amount='2400',total='17400')
     result=generation.build_generation(source,vat_in_line_amounts=False)
     row=result['items'][0]
-    assert row['quantity']=='15000' and row['price']=='1' and row['amount']=='15000.00'
+    assert row['quantity']=='1' and row['price']=='15000.00' and row['amount']=='15000.00'
     assert result['total']=='17400' and result['vat_amount']=='2400'
 
 
@@ -118,3 +118,26 @@ def test_no_separate_vat_does_not_add_tax_to_prices():
     assert model['generation']['vat_in_line_amounts'] is False
     assert model['generation'].get('price_decimal_places') is None
     assert model['rounding_notes']==[]
+
+
+@pytest.mark.parametrize('service,source_price,vat,expected_quantity,expected_price',[
+    (True,'1','800','1','5800.00'),
+    (True,'1','0','1','5000.00'),
+    (True,'1.16','0','1','5800.00'),
+    (False,'1','800','5000','1.16'),
+    (True,'2','1600','5000','2.32'),
+])
+def test_service_quantity_encoded_amount(service,source_price,vat,expected_quantity,expected_price,monkeypatch):
+    from decimal import Decimal
+    from App.invoicing import invoice_generation as generation
+    monkeypatch.setattr(generation,'apply_training_pairs',lambda *a,**k:dict(items=[]))
+    source=dict(items=[dict(row_id='1',name='Тест',quantity='5000',price=source_price,
+                           line_kind='service' if service else 'product')],
+                vat_amount=vat,total=str(Decimal('5000')*Decimal(source_price)+Decimal(vat)))
+    before=copy.deepcopy(source)
+    result=generation.build_generation(source,suggest=False,vat_in_line_amounts=True,preserve_receipt_quantities=True)
+    row=result['items'][0]
+    assert Decimal(row['quantity'])==Decimal(expected_quantity)
+    assert Decimal(row['price'])==Decimal(expected_price)
+    assert source==before
+    assert Decimal(row['quantity'])*Decimal(row['price'])==Decimal(row['amount'])

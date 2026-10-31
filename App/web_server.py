@@ -333,18 +333,6 @@ def create_server(host=None, port=None, output_dir=None, processor=None, max_upl
                     return self.send_json(dict(error=str(error)), 409)
                 except Exception:
                     return self.send_json(dict(error="Счёт не построен: внутренняя ошибка расчёта."), 500)
-                reasons = []
-                if not model.get("finalized"):
-                    reasons.append("Электронный чек не подтверждён оператором.")
-                if model.get("validation_status") != "match":
-                    status = model.get("validation_status") or "нет данных"
-                    reasons.append(f"Чек не сверен полностью ({status}).")
-                if not model.get("ready"):
-                    reasons.extend(model.get("blocked") or [])
-                reasons = list(dict.fromkeys(reasons))
-                if reasons:
-                    return self.send_json(dict(error="Счёт ещё не готов для 1С.", reasons=reasons,
-                                               state=task.state), 409)
                 if revision and revision != model.get("revision"):
                     return self.send_json(dict(
                         error="Счёт изменился после загрузки страницы. Обновите страницу и подтвердите заново.",
@@ -378,29 +366,28 @@ def create_server(host=None, port=None, output_dir=None, processor=None, max_upl
                 if value and value.casefold() != expected.casefold():
                     return 409, dict(
                         error="Задание относится к другой базе/форме 1С. Форму не менять.")
-            if task.stale_reason:
-                return 409, dict(
-                    error="Результат изменён после подтверждения. Подтвердите его заново.",
-                    reasons=[task.stale_reason], state=task.state)
-            if task.confirmed_at is None or not task.result.get("checksum"):
-                return 202, dict(error="Результат ещё не подтверждён.",
-                                 state=task.state, ui_url=task_document(task)["ui_url"])
-            job = store.get(task.job_id) if task.job_id else None
-            if job is not None and task.applied is None:
-                current = None
+            # Formed invoices are published automatically; no operator confirmation.
+            if task.applied is None:
+                job = store.get(task.job_id) if task.job_id else None
+                if job is None:
+                    return 202, dict(error="Счёт ещё не сформирован.", state=task.state)
                 with job.condition:
-                    if job.status == "done" and job.result:
-                        try:
-                            current = contract.input_revision(
-                                job.result, invoice_service.load_selections(job))
-                        except ValueError:
-                            current = None
-                if current and task.input_revision and current != task.input_revision:
-                    exchange.invalidate_job(
-                        job.id, "Данные счёта изменились после подтверждения; подтвердите результат заново.")
-                    return 409, dict(
-                        error="Результат изменён после подтверждения. Подтвердите его заново.",
-                        reasons=["Изменились чек, связи номенклатуры или справочник 1С."])
+                    if job.status != "done" or not job.result:
+                        return 202, dict(error="Счёт ещё формируется.", state=task.state)
+                    try:
+                        selections = invoice_service.load_selections(job)
+                        model = invoice_service.invoice_model(job.result, selections=selections,
+                                                              database_id=self.invoice_context(job))
+                        if not model.get("can_render"):
+                            return 202, dict(error="Счёт ещё не сформирован.", state=task.state)
+                        current = task
+                        task, _ = exchange.confirm(
+                            task.task_id, model["revision"], contract.input_revision(job.result, selections),
+                            lambda version: contract.build_snapshot(current, model, job.result, version))
+                    except (ValueError, ExchangeConflict) as error:
+                        return 409, dict(error=str(error))
+                    except OSError:
+                        return 500, dict(error="Не удалось сохранить результат счёта.")
             snapshot = exchange.load_result(task)
             if (snapshot is None or snapshot.get("checksum") != task.result.get("checksum")
                     or contract.checksum(snapshot) != snapshot.get("checksum")):

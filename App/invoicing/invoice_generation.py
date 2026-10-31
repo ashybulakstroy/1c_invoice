@@ -351,6 +351,16 @@ def build_generation(receipt, selections=None, suggest=False, database_id=None, 
             if last["match_status"] == "manual" and last["service"] and selection.get("price") is not None:
                 last.update(transformed_numbers(amount, last["quantity"], selection["price"]))
     for row in items:
+        source = source_rows[row['source_index']]
+        # Service totals encoded as quantity × 1 (or 1.16) become one service.
+        if ((row.get('service') or source.get('line_kind') == 'service')
+                and Decimal(row['source_price']) in {Decimal('1'), Decimal('1.16')}
+                and Decimal(row['source_quantity']) > 1):
+            row.update(quantity='1', price=format(Decimal(row['amount']).quantize(CENT, rounding=ROUND_HALF_UP), '.2f'),
+                       quantity_mode='service', service_quantity_collapsed=True)
+            for target in row.get('approved_targets', []):
+                if target.get('service'):
+                    target.update(quantity='1', quantity_mode='service')
         for target in row.get("approved_targets", []):
             target["amount"] = row["amount"]
             target["price"] = str((Decimal(row["amount"]) / Decimal(target["quantity"])).quantize(UNIT_PRICE_STEP, rounding=ROUND_HALF_UP))

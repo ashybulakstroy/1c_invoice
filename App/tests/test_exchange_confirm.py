@@ -99,21 +99,29 @@ def prepared_task(base, instance):
     return task
 
 
-def test_result_is_202_before_confirmation(server):
+def test_formed_invoice_available_without_confirmation(server):
     instance, base = server
     task = prepared_task(base, instance)
+    job = instance.store.jobs[task['job_id']]
+    job.result = copy.deepcopy(job.result)
+    job.result['finalized'] = False
+    model = invoice_model(job.result)
+    assert model['can_render'] and not model['ready']
     status, data = get(f"{base}/tasks/{task['task_id']}/result"
                        f"?database_id={DATABASE}&request_id={REQUEST}")
-    assert status == 202 and data["state"] == "review"
+    assert status == 200 and data["items"]
+    assert data['items'][0]['target']['name'] == model['generation']['items'][0]['name']
+    assert data['total'] == model['document']['total']
+    assert data['items'][0]['match_status'] == 'suggested'
     status, data = get(f"{base}/tasks/{task['task_id']}/result")
-    assert status == 202
+    assert status == 200
 
 
 def test_confirm_requires_ready_invoice_and_matching_revision(server):
     instance, base = server
     task = prepared_task(base, instance)
     status, data = post(f"{base}/tasks/{task['task_id']}/confirm", {})
-    assert status == 409 and data["reasons"]
+    assert status == 200
     # Save explicit links, then a stale revision from an older page is refused.
     status, model = post(f"{base}/api/jobs/{task['job_id']}/invoice/selections",
                          {"selections": FULL_SELECTIONS})
@@ -209,7 +217,7 @@ def test_edit_makes_confirmation_stale_and_new_version_is_frozen(server):
     status, state = get(f"{base}/tasks/{task['task_id']}/ui/state")
     assert state["state"] == "review" and state["stale_reason"]
     status, data = get(f"{base}/tasks/{task['task_id']}/result")
-    assert status == 409 and data["state"] == "review"
+    assert status == 200 and data["result_version"] == 2
 
     # The edited row needs a new explicit link; the old selection is stale.
     selections = copy.deepcopy(FULL_SELECTIONS)
@@ -219,14 +227,14 @@ def test_edit_makes_confirmation_stale_and_new_version_is_frozen(server):
     assert status == 200 and model["ready"], model["blocked"]
     status, reconfirmed = post(f"{base}/tasks/{task['task_id']}/confirm",
                                {"revision": model["revision"]})
-    assert status == 200 and reconfirmed["result_version"] == 2
+    assert status == 200 and reconfirmed["result_version"] == 3
     status, snapshot = get(f"{base}/tasks/{task['task_id']}/result")
-    assert status == 200 and snapshot["result_version"] == 2
+    assert status == 200 and snapshot["result_version"] == 3
     assert snapshot["items"][1]["target"]["name"] == "Грунтовка 1С Г-22"
     # Version 1 is preserved on disk as evidence of the previous confirmation.
     versions = sorted(path.name for path in
                       (instance.store.root / "exchange" / task["task_id"]).glob("result-v*.json"))
-    assert versions == ["result-v1.json", "result-v2.json"]
+    assert versions == ["result-v1.json", "result-v2.json", "result-v3.json"]
 
 
 def test_confirm_unknown_task_and_invalid_body(server):
