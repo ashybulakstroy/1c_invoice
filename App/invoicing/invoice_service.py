@@ -232,6 +232,28 @@ def _exact_amounts(source: dict, generation_result: dict) -> list[str]:
     return problems
 
 
+def exchange_reasons(model: dict) -> list[str]:
+    """Completeness for exchange, independently of mapping learning/finalizing."""
+    reasons=[]
+    if model.get('validation_status') != 'match':
+        reasons.append('Числа чека не прошли контрольную сверку.')
+    items=model.get('generation', {}).get('items', [])
+    if not items:
+        reasons.append('Нет завершённых строк счёта.')
+    for row in items:
+        if not row.get('name') or not row.get('unit'):
+            reasons.append(f"Строка {row.get('row_id')}: выберите товар 1С и единицу.")
+        for field in ('quantity','price','amount','source_amount'):
+            try:
+                number=Decimal(str(row.get(field)))
+                valid=number.is_finite() and number>0
+            except (InvalidOperation, ValueError, TypeError):
+                valid=False
+            if not valid:
+                reasons.append(f"Строка {row.get('row_id')}: заполните {field}.")
+    return list(dict.fromkeys(reasons))
+
+
 def invoice_model(receipt: dict, selections: dict[str, dict] | None = None,
                   suggest: bool = True, database_id: str | None = None) -> dict:
     """Full model for GET/preview: generation, document, candidates, readiness."""
@@ -279,7 +301,7 @@ def invoice_model(receipt: dict, selections: dict[str, dict] | None = None,
     for row_id, entry in clean.items():
         portable = {key: value for key, value in entry.items() if key != "source_fingerprint"}
         stored[row_id] = portable
-    return {
+    model = {
         "schema_version": 1,
         "job_id": snapshot.job_id,
         "receipt_revision": snapshot.revision,
@@ -297,6 +319,9 @@ def invoice_model(receipt: dict, selections: dict[str, dict] | None = None,
         "selections": stored,
         "rounding_notes": rounding_notes,
     }
+    model['exchange_reasons'] = exchange_reasons(model)
+    model['exchange_ready'] = not model['exchange_reasons']
+    return model
 
 
 def train_from_selections(receipt: dict, selections: dict[str, dict], *,

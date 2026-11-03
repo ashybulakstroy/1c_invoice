@@ -126,6 +126,7 @@ def task_document(task: ExchangeTask, base_url: str = "") -> dict:
         "checksum": task.result.get("checksum"),
         "stale_reason": task.stale_reason,
         "applied": applied is not None,
+        "confirmed_by_operator": task.result.get("confirmation_origin") == "operator" and task.confirmed_at is not None,
         "receipts": len(task.receipts),
         "ui_url": ui_url,
     }
@@ -249,7 +250,7 @@ class ExchangeStore:
         return data if isinstance(data, dict) else None
 
     def confirm(self, task_id: str, revision: str, input_revision: str,
-                snapshot_factory) -> tuple[ExchangeTask, bool]:
+                snapshot_factory, *, confirmed=True) -> tuple[ExchangeTask, bool]:
         """Freeze a new result version or return the matching confirmation.
 
         ``snapshot_factory(version)`` builds the full JSON snapshot while the
@@ -258,11 +259,14 @@ class ExchangeStore:
         """
         with self.lock:
             task = self.get(task_id)
-            if (task.confirmed_at is not None and not task.stale_reason
+            expected_status = 'confirmed' if confirmed else 'ready_unconfirmed'
+            if (not task.stale_reason and task.result.get('status', 'confirmed') == expected_status
                     and task.confirmed_revision == revision
                     and task.input_revision == input_revision
                     and task.result.get("checksum")):
                 return task, False
+            if task.applied is not None:
+                raise ExchangeConflict("Результат уже применён в 1С")
             version = task.result_version + 1
             snapshot = snapshot_factory(version)
             if snapshot.get("revision") != revision:
@@ -274,12 +278,14 @@ class ExchangeStore:
                                  encoding="utf-8")
             temporary.replace(path)
             task.result_version = version
-            task.confirmed_at = time.time()
+            task.confirmed_at = time.time() if confirmed else None
             task.confirmed_revision = revision
             task.input_revision = input_revision
             task.stale_reason = None
             task.result = {
                 "version": version,
+                "status": expected_status,
+                "confirmation_origin": 'operator' if confirmed else None,
                 "revision": revision,
                 "checksum": snapshot["checksum"],
                 "confirmed_at": snapshot.get("confirmed_at"),
@@ -295,7 +301,7 @@ class ExchangeStore:
             task = self.for_job(job_id)
             if task is None or task.applied is not None:
                 return None
-            if task.confirmed_at is None or task.stale_reason:
+            if not task.result.get("checksum") or task.stale_reason:
                 return None
             task.stale_reason = reason or "Данные счёта изменились; подтвердите результат заново."
             self._save(task)

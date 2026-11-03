@@ -13,6 +13,7 @@ function clearPdf(){
   INV.pdfUrl=null;
 }
 function markDirty(){
+  $('ocr-confirm-success').hidden=true;
   INV.dirty=true;clearPdf();
   $('invoice-pdf').hidden=true;
   $('invoice-train').disabled=true;
@@ -249,31 +250,50 @@ function render(){
 function refreshTaskConfirm(){
   const button=$('invoice-confirm'),note=$('invoice-confirm-state');
   if(!button||!note)return;
-  if(!TASK){button.hidden=true;note.hidden=true;return;}
+  if(!TASK){button.hidden=true;note.hidden=true;$('ocr-confirm-success').hidden=true;return;}
   const task=TASK.state||{};
   const revision=INV.model?.revision||null;
   const applied=task.state==='applied';
-  const confirmed=task.state==='confirmed'||applied;
+  const confirmed=(task.state==='confirmed'&&task.confirmed_by_operator)||applied;
   const current=confirmed&&!task.stale_reason&&!!revision&&task.revision===revision;
-  button.hidden=true;note.hidden=false;
-  button.disabled=INV.busy||INV.dirty||!INV.model?.ready||current||applied;
-  button.textContent=applied?'Счёт записан в 1С':current?'Подтверждено для 1С':(confirmed||task.stale_reason?'Подтвердить заново':'Подтвердить для 1С');
+  button.hidden=false;note.hidden=false;
+  button.disabled=INV.busy||(!INV.dirty&&!INV.model?.exchange_ready)||current||applied;
+  button.textContent=applied?'Счёт записан в 1С':current?'Подтверждено для 1С':(confirmed||task.stale_reason?'Подтвердить заново':'Подтвердить и передать в 1С');
   note.className='task-badge'+((current||applied)?' done':task.stale_reason?' wait':'');
   note.textContent=applied?`Применено в 1С, версия ${task.result_version}`:
     current?`Снимок для 1С: версия ${task.result_version}`:
-    task.stale_reason?'Обновлённый счёт доступен для получения в 1С':
-    task.state==='confirmed'?'Обновлённый счёт доступен для получения в 1С':'Сформированный счёт можно получить в 1С';
+    task.stale_reason?'Счёт изменён — для автоимпорта подтвердите заново':
+    'Для автоимпорта подтвердите; вручную можно получить готовый счёт из 1С';
+  $('ocr-confirm-success').hidden=!(current&&task.confirmed_by_operator&&!INV.dirty&&$('invoice-confirm-error').hidden);
 }
 
 async function confirmFor1C(){
-  if(!TASK||!INV.model)return;
+  if(!TASK||!INV.model||INV.busy)return;
+  const errorPanel=$('invoice-confirm-error');
+  errorPanel.hidden=true;
   INV.busy=true;refresh();
   try{
-    const task=await TASK.confirm(INV.model.revision);
-    toast(`Результат зафиксирован для 1С (версия ${task.result_version}). Вернитесь в 1С и нажмите «Получить результат».`);
+    {
+      const response=await fetch(`/api/jobs/${INV.jobId}/invoice/selections`,{
+        method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(selectionPayload())});
+      const model=await response.json();
+      if(!response.ok)throw Error(model.error||'Не удалось сохранить выбор товаров');
+      INV.model=model;INV.dirty=false;pickFromRows(model);
+      await loadPrintPreview(selectionPayload());
+    }
+    await TASK.confirm(INV.model.revision);
+    refresh();
+    const panel=$('ocr-confirm-success');
+    panel.hidden=false;
+    requestAnimationFrame(()=>{
+      panel.scrollIntoView({behavior:'smooth',block:'center'});
+      try{panel.focus({preventScroll:true});}catch{panel.focus();}
+    });
   }catch(error){
-    const reason=error.reasons&&error.reasons.length?' Первое замечание: '+error.reasons[0]:'';
-    toast((error.message||'Не удалось подтвердить результат')+reason);
+    $('ocr-confirm-success').hidden=true;
+    const reasons=error.reasons?.length?' '+error.reasons.join(' '):'';
+    errorPanel.textContent=(error.message||'Не удалось подтвердить результат')+reasons;
+    errorPanel.hidden=false;
   }finally{INV.busy=false;refresh();}
 }
 
@@ -368,6 +388,7 @@ function start(){
   $('invoice-preview').addEventListener('click',()=>send('preview'));
   $('invoice-train').addEventListener('click',()=>send('train'));
   $('invoice-confirm')?.addEventListener('click',confirmFor1C);
+  window.addEventListener('ocr-task-state',refreshTaskConfirm);
   setInterval(sync,1200);
 }
 start();

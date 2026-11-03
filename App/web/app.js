@@ -491,6 +491,7 @@ function updateTaskBadge(task){
   const badge=$('task-badge');
   if(!TASK){return;}
   TASK_STATE=task||null;
+  window.dispatchEvent(new Event('ocr-task-state'));
   if(!badge)return;
   badge.hidden=false;
   badge.className='task-badge'+(task?.state==='confirmed'||task?.state==='applied'?' done':task?.stale_reason?' wait':'');
@@ -514,6 +515,9 @@ window.OCRTask=TASK?{
     if(!response.ok){
       const error=Error(data.error||'Не удалось подтвердить результат для 1С');
       error.reasons=data.reasons||[];throw error;
+    }
+    if(response.status!==200||data.state!=='confirmed'||!data.confirmed_by_operator){
+      throw Error('Подтверждение ещё не сохранено сервером. Повторите попытку.');
     }
     updateTaskBadge(data);return data;
   }

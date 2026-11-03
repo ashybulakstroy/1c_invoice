@@ -260,7 +260,7 @@ def test_result_xml_matches_frozen_json(server):
     assert root.findtext("checksum") == confirmed["checksum"]
     assert root.findtext("result_version") == str(confirmed["result_version"])
     assert root.findtext("currency") == "KZT"
-    assert root.findtext("prices_include_vat") == "true"
+    assert root.findtext("prices_include_vat") == "false"
     items = root.findall("./items/item")
     assert len(items) == 3
     assert items[0].findtext("row_id") == "2"
@@ -295,8 +295,8 @@ def test_result_xml_status_codes_and_foreign_identifiers(server):
     assert status == 200
     url = f"{base}/tasks/{task['task_id']}/result.xml"
     status, content_type, body = fetch(url)
-    assert status == 200 and content_type == "application/xml"
-    assert ET.fromstring(body).findtext("result_version") == "2"
+    assert status == 202 and content_type == "application/json"
+    assert json.loads(body)['state'] == 'review'
 
 
 def test_xml_conditions_and_fingerprint_are_canonical():
@@ -312,3 +312,13 @@ def test_xml_conditions_and_fingerprint_are_canonical():
         contract.fingerprint({"b": "я", "a": 1})
     assert contract.fingerprint({"a": 1, "b": "я"}) != \
         contract.fingerprint({"a": 1, "b": "я", "c": 0})
+
+
+def test_manual_draft_can_be_acknowledged_without_web_confirmation(server):
+    instance,base=server
+    task=prepared_task(base,instance)
+    status,draft=get(f"{base}/tasks/{task['task_id']}/result?allow_unconfirmed=1")
+    assert status==200 and draft['status']=='ready_unconfirmed'
+    payload=receipt_payload(dict(result_version=draft['result_version'],checksum=draft['checksum']))
+    status,data=post(f"{base}/tasks/{task['task_id']}/import-receipt",payload)
+    assert status==200 and data['state']=='applied'

@@ -99,22 +99,28 @@ def prepared_task(base, instance):
     return task
 
 
-def test_formed_invoice_available_without_confirmation(server):
+def test_two_modes_draft_does_not_confirm(server):
     instance, base = server
     task = prepared_task(base, instance)
-    job = instance.store.jobs[task['job_id']]
-    job.result = copy.deepcopy(job.result)
-    job.result['finalized'] = False
-    model = invoice_model(job.result)
-    assert model['can_render'] and not model['ready']
-    status, data = get(f"{base}/tasks/{task['task_id']}/result"
-                       f"?database_id={DATABASE}&request_id={REQUEST}")
-    assert status == 200 and data["items"]
-    assert data['items'][0]['target']['name'] == model['generation']['items'][0]['name']
-    assert data['total'] == model['document']['total']
-    assert data['items'][0]['match_status'] == 'suggested'
-    status, data = get(f"{base}/tasks/{task['task_id']}/result")
-    assert status == 200
+    job=instance.store.jobs[task['job_id']]
+    job.result=copy.deepcopy(job.result)
+    job.result['finalized']=False
+    model=invoice_model(job.result)
+    assert model['can_render'] and not model['ready'] and model['exchange_ready']
+    url=f"{base}/tasks/{task['task_id']}/result"
+    assert get(url)[0]==202
+    status,draft=get(url+'?allow_unconfirmed=1')
+    assert status==200 and draft['status']=='ready_unconfirmed' and draft['ocr_complete'] is True
+    assert draft['confirmed_at'] is None
+    assert draft['items'][0]['target']['name']==model['generation']['items'][0]['name']
+    assert get(url+'?allow_unconfirmed=1')[1]==draft
+    assert get(url)[0]==202
+    assert get(f"{base}/tasks/{task['task_id']}/ui/state")[1]['state']=='review'
+    status,confirmed=post(f"{base}/tasks/{task['task_id']}/confirm",{'revision':model['revision']})
+    assert status==200 and confirmed['result_version']==2
+    for suffix in ('','?allow_unconfirmed=1'):
+        status,data=get(url+suffix)
+        assert status==200 and data['status']=='confirmed' and data['result_version']==2
 
 
 def test_confirm_requires_ready_invoice_and_matching_revision(server):
@@ -155,7 +161,7 @@ def test_confirm_freezes_json_1_1_and_is_idempotent(server):
     assert snapshot["schema_version"] == "1.1" and snapshot["status"] == "confirmed"
     assert snapshot["task_id"] == task["task_id"]
     assert snapshot["database_id"] == DATABASE and snapshot["request_id"] == REQUEST
-    assert snapshot["currency"] == "KZT" and snapshot["prices_include_vat"] is True
+    assert snapshot["currency"] == "KZT" and snapshot["prices_include_vat"] is False
     assert snapshot["result_version"] == 1 and snapshot["revision"] == model["revision"]
     assert snapshot["document_uuid"] is None
     assert snapshot["source_order_number"] == "1234567890"
@@ -217,7 +223,7 @@ def test_edit_makes_confirmation_stale_and_new_version_is_frozen(server):
     status, state = get(f"{base}/tasks/{task['task_id']}/ui/state")
     assert state["state"] == "review" and state["stale_reason"]
     status, data = get(f"{base}/tasks/{task['task_id']}/result")
-    assert status == 200 and data["result_version"] == 2
+    assert status == 202 and data["state"] == "review"
 
     # The edited row needs a new explicit link; the old selection is stale.
     selections = copy.deepcopy(FULL_SELECTIONS)
@@ -227,14 +233,14 @@ def test_edit_makes_confirmation_stale_and_new_version_is_frozen(server):
     assert status == 200 and model["ready"], model["blocked"]
     status, reconfirmed = post(f"{base}/tasks/{task['task_id']}/confirm",
                                {"revision": model["revision"]})
-    assert status == 200 and reconfirmed["result_version"] == 3
+    assert status == 200 and reconfirmed["result_version"] == 2
     status, snapshot = get(f"{base}/tasks/{task['task_id']}/result")
-    assert status == 200 and snapshot["result_version"] == 3
+    assert status == 200 and snapshot["result_version"] == 2
     assert snapshot["items"][1]["target"]["name"] == "Грунтовка 1С Г-22"
     # Version 1 is preserved on disk as evidence of the previous confirmation.
     versions = sorted(path.name for path in
                       (instance.store.root / "exchange" / task["task_id"]).glob("result-v*.json"))
-    assert versions == ["result-v1.json", "result-v2.json", "result-v3.json"]
+    assert versions == ["result-v1.json", "result-v2.json"]
 
 
 def test_confirm_unknown_task_and_invalid_body(server):
@@ -266,3 +272,120 @@ def test_snapshot_contract_maps_confirmed_fields():
     assert snapshot["items"][1]["target"]["quantity_mode"] == "factor"
     assert snapshot["items"][2]["target"]["quantity_mode"] == "service"
     assert snapshot["items"][2]["target"]["quantity_factor"] == "1"
+
+
+def test_net_vat_contract_preserves_receipt_and_gross_pdf():
+    receipt=copy.deepcopy(RECEIPT)
+    receipt['job_id']='a'*32
+    receipt['rows']=[
+        dict(row=1,kind='product',name='Профиль стеновой 100/50',name_raw='Профиль',quantity='100',price='1870',line_total='187000',name_confirmed=True),
+        dict(row=2,kind='service',name='Доставка',name_raw='Доставка',quantity='5000',price='1',line_total='5000',name_confirmed=True),
+        dict(row=3,kind='tax',name='НДС 16 %',quantity='30720',price='1',line_total='30720')]
+    receipt['expected_total']='222720'
+    from App.receipt_editing import update_receipt
+    receipt=update_receipt(receipt)
+    before=copy.deepcopy(receipt)
+    selections={'1':dict(name='Профиль стеновой 100/50',unit='шт',quantity='100',service=False),
+                '2':dict(name='Доставка',unit='усл',quantity='1',service=True)}
+    model=invoice_model(receipt,selections)
+    task=ExchangeTask(task_id='b'*32,database_id=DATABASE,request_id=REQUEST,created_at=time.time(),job_id='a'*32)
+    snapshot=contract.build_snapshot(task,model,receipt,1)
+    assert snapshot['prices_include_vat'] is False and snapshot['price_includes_vat'] is False
+    assert len(snapshot['items'])==2
+    first,delivery=[item['target'] for item in snapshot['items']]
+    assert first['quantity']=='100' and first['price']=='1870.00' and first['amount']=='187000.00'
+    assert delivery['quantity']=='1' and delivery['price']=='5000.00' and delivery['amount']=='5000.00'
+    assert snapshot['totals']==dict(amount_without_vat='192000.00',vat='30720.00',amount_with_vat='222720.00')
+    assert snapshot['vat_rate']=='16'
+    assert model['generation']['items'][0]['price']=='2169.20'
+    assert model['generation']['items'][1]['price']=='5800.00'
+    assert receipt==before
+    assert snapshot['checksum']==contract.checksum(snapshot)
+    for item in snapshot['items']:
+        assert item['target']['price_includes_vat'] is False
+        assert all(t['price_includes_vat'] is False for t in item['allowed_targets'])
+        assert all(t['amount']==item['target']['amount'] for t in item['allowed_targets'])
+
+
+@pytest.mark.parametrize('state',['waiting','running','failed','incomplete'])
+def test_never_exposes_unfinished_rows(server,state):
+    instance,base=server
+    if state=='waiting':
+        task=create_task(base)
+    else:
+        task=prepared_task(base,instance)
+        job=instance.store.jobs[task['job_id']]
+        if state in ('running','failed'):
+            job.status=state
+        else:
+            job.result=copy.deepcopy(job.result)
+            job.result['calculation']['validation_status']='mismatch'
+            job.result['rows'][1]['price']=''
+    url=f"{base}/tasks/{task['task_id']}/result"
+    for suffix in ('','?allow_unconfirmed=1'):
+        status,data=get(url+suffix)
+        assert status==202 and 'items' not in data
+    assert post(f"{base}/tasks/{task['task_id']}/confirm",{})[0]==409
+
+
+def test_draft_identity_checks_and_persistence(server):
+    from App.exchange import ExchangeStore
+    instance,base=server
+    task=prepared_task(base,instance)
+    url=f"{base}/tasks/{task['task_id']}/result"
+    for key in ('database_id','request_id'):
+        status,data=get(url+f'?allow_unconfirmed=1&{key}=foreign')
+        assert status==409 and 'items' not in data
+    status,draft=get(url+'?allow_unconfirmed=1')
+    assert status==200 and draft['status']=='ready_unconfirmed'
+    saved=ExchangeStore(instance.store.root / "exchange").get(task['task_id'])
+    assert saved.confirmed_at is None and saved.state=='review'
+    assert saved.result_version==draft['result_version']
+    assert ExchangeStore(instance.store.root / "exchange").load_result(saved)==draft
+
+
+def test_corrected_numbers_are_used_in_both_modes(server):
+    instance,base=server
+    task=prepared_task(base,instance)
+    job=instance.store.jobs[task['job_id']]
+    status,edited=post(f"{base}/api/jobs/{job.id}/edits",dict(revision=job.result['revision'],row=2,quantity='2',price='1300',expected_total='3650'))
+    assert status==200,edited
+    url=f"{base}/tasks/{task['task_id']}/result"
+    assert get(url)[0]==202
+    status,draft=get(url+'?allow_unconfirmed=1')
+    assert status==200,draft
+    assert draft['items'][0]['source']['quantity']=='2'
+    assert draft['items'][0]['source']['price']=='1300'
+    assert draft['items'][0]['target']['amount']=='2600.00'
+    assert post(f"{base}/tasks/{task['task_id']}/confirm",{})[0]==200
+    status,confirmed=get(url)
+    assert status==200 and confirmed['items']==draft['items']
+
+
+def test_confirmed_server_restart(tmp_path):
+    from App.receipt_editing import update_receipt
+    def process(job):
+        receipt=copy.deepcopy(RECEIPT)
+        receipt['job_id']=job.id
+        return update_receipt(receipt)
+    def start():
+        instance=create_server('127.0.0.1',0,tmp_path,process)
+        thread=threading.Thread(target=instance.serve_forever,daemon=True);thread.start()
+        return instance,thread,f'http://127.0.0.1:{instance.server_port}'
+    def stop(instance,thread):
+        instance.shutdown();instance.server_close();instance.store.pool.shutdown(wait=True);thread.join(timeout=3)
+    instance,thread,base=start()
+    try:
+        task=prepared_task(base,instance)
+        assert post(f"{base}/tasks/{task['task_id']}/confirm",{})[0]==200
+        status,before=get(f"{base}/tasks/{task['task_id']}/result")
+        assert status==200
+    finally:
+        stop(instance,thread)
+    instance,thread,base=start()
+    try:
+        status,after=get(f"{base}/tasks/{task['task_id']}/result")
+        assert status==200 and after==before
+        assert get(f"{base}/tasks/{task['task_id']}/ui/state")[1]['confirmed_by_operator'] is True
+    finally:
+        stop(instance,thread)

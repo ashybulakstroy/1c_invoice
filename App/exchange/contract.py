@@ -17,7 +17,7 @@ import json
 import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 from App.invoicing.invoice_service import _catalog_signature, _issuer_signature
 from App.invoicing.receipt_adapter import snapshot_from_receipt
@@ -53,6 +53,7 @@ def input_revision(receipt: dict, selections: dict | None = None) -> str:
     snapshot = snapshot_from_receipt(receipt)
     payload = {
         "receipt_fingerprint": snapshot.fingerprint,
+        "tax_basis": "net-line-prices-v3-dual-mode",
         "selections": selections or {},
         "catalog_signature": _catalog_signature(),
         "issuer_signature": _issuer_signature(),
@@ -133,7 +134,7 @@ def _source(row: dict, line=None) -> dict:
     }
 
 
-def build_snapshot(task, model: dict, receipt: dict, version: int, now: float | None = None) -> dict:
+def build_snapshot(task, model: dict, receipt: dict, version: int, now: float | None = None, *, status="confirmed") -> dict:
     """JSON 1.1 snapshot for one confirmation of ``task``.
 
     ``model`` is the current ``invoice_service.invoice_model`` result; the
@@ -143,17 +144,25 @@ def build_snapshot(task, model: dict, receipt: dict, version: int, now: float | 
     receipt_lines = {str(line.row_id): line for line in receipt_snapshot.lines}
     items = []
     for row in model["generation"]["items"]:
-        status = row.get("match_status")
+        match_status = row.get("match_status")
         target = _target(row, allow_missing=True)
         row_id = str(row.get("row_id"))
+        allowed = [target] if match_status not in CONFIRMED_TARGETS else _allowed_targets(row)
+        # Exchange uses original net receipt amounts, independently of gross PDF.
+        net_amount = Decimal(str(row['source_amount']))
+        for candidate in [target] + allowed:
+            quantity = Decimal(str(candidate['quantity']))
+            candidate['price_includes_vat'] = False
+            candidate['amount'] = format(net_amount.quantize(Decimal('.01'), rounding=ROUND_HALF_UP), '.2f')
+            candidate['price'] = format((net_amount / quantity).quantize(Decimal('.01'), rounding=ROUND_HALF_UP), '.2f') if quantity else '0.00'
         items.append({
             "row_id": row_id,
-            "match_status": status,
+            "match_status": match_status,
             "photo_id": task.job_id,
             "source": _source(row, receipt_lines.get(row_id)),
             "target": target,
-            "allowed_targets": [target] if status not in CONFIRMED_TARGETS else _allowed_targets(row),
-            "selection_policy": "approved_alternatives" if status in {"remembered", "learned"} else "explicit",
+            "allowed_targets": allowed,
+            "selection_policy": "approved_alternatives" if match_status in {"remembered", "learned"} else "explicit",
         })
     document = model["document"]
     moment = time.time() if now is None else now
@@ -161,7 +170,9 @@ def build_snapshot(task, model: dict, receipt: dict, version: int, now: float | 
                     .isoformat(timespec="seconds").replace("+00:00", "Z"))
     snapshot = {
         "schema_version": SCHEMA_VERSION,
-        "status": STATUS_CONFIRMED,
+        "status": status,
+        "ocr_complete": True,
+        "confirmation_origin": "operator" if status == "confirmed" else None,
         "task_id": task.task_id,
         "database_id": task.database_id,
         "request_id": task.request_id,
@@ -169,14 +180,20 @@ def build_snapshot(task, model: dict, receipt: dict, version: int, now: float | 
         "result_version": version,
         "revision": model.get("revision"),
         "currency": CURRENCY,
-        "prices_include_vat": True,
+        "prices_include_vat": False,
+        "price_includes_vat": False,
         "date": document.get("date"),
         "source_order_number": receipt_snapshot.order_number,
         "vat_rate": (str(receipt_snapshot.vat.rate_percent)
                      if receipt_snapshot.vat.rate_percent is not None else None),
         "vat_amount": document.get("vat_amount"),
         "total": document.get("total"),
-        "confirmed_at": confirmed_at,
+        "totals": {
+            "amount_without_vat": format(sum((Decimal(item['target']['amount']) for item in items), Decimal(0)), '.2f'),
+            "vat": format(Decimal(str(document.get('vat_amount') or 0)), '.2f'),
+            "amount_with_vat": document.get('total'),
+        },
+        "confirmed_at": confirmed_at if status == "confirmed" else None,
         "items": items,
     }
     snapshot["checksum"] = checksum(snapshot)

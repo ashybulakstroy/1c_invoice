@@ -333,6 +333,9 @@ def create_server(host=None, port=None, output_dir=None, processor=None, max_upl
                     return self.send_json(dict(error=str(error)), 409)
                 except Exception:
                     return self.send_json(dict(error="Счёт не построен: внутренняя ошибка расчёта."), 500)
+                reasons = invoice_service.exchange_reasons(model)
+                if reasons:
+                    return self.send_json(dict(error="Счёт ещё не готов для 1С.", reasons=reasons), 409)
                 if revision and revision != model.get("revision"):
                     return self.send_json(dict(
                         error="Счёт изменился после загрузки страницы. Обновите страницу и подтвердите заново.",
@@ -366,24 +369,36 @@ def create_server(host=None, port=None, output_dir=None, processor=None, max_upl
                 if value and value.casefold() != expected.casefold():
                     return 409, dict(
                         error="Задание относится к другой базе/форме 1С. Форму не менять.")
-            # Formed invoices are published automatically; no operator confirmation.
+            allow_unconfirmed = (params.get('allow_unconfirmed') or [''])[0] == '1'
             if task.applied is None:
                 job = store.get(task.job_id) if task.job_id else None
                 if job is None:
                     return 202, dict(error="Счёт ещё не сформирован.", state=task.state)
                 with job.condition:
                     if job.status != "done" or not job.result:
-                        return 202, dict(error="Счёт ещё формируется.", state=task.state)
+                        return 202, dict(error="Счёт ещё формируется или требует исправления.", state=task.state)
                     try:
                         selections = invoice_service.load_selections(job)
-                        model = invoice_service.invoice_model(job.result, selections=selections,
-                                                              database_id=self.invoice_context(job))
-                        if not model.get("can_render"):
-                            return 202, dict(error="Счёт ещё не сформирован.", state=task.state)
-                        current = task
-                        task, _ = exchange.confirm(
-                            task.task_id, model["revision"], contract.input_revision(job.result, selections),
-                            lambda version: contract.build_snapshot(current, model, job.result, version))
+                        fingerprint = contract.input_revision(job.result, selections)
+                        current_confirmation = (task.confirmed_at is not None and not task.stale_reason
+                            and task.input_revision == fingerprint
+                            and task.result.get('confirmation_origin') == 'operator')
+                        if not current_confirmation:
+                            if task.input_revision and task.input_revision != fingerprint:
+                                exchange.invalidate_job(job.id, 'Счёт изменён; требуется новое веб-подтверждение для автоимпорта.')
+                            if not allow_unconfirmed:
+                                return 202, dict(error="Ожидается веб-подтверждение для автоматического импорта.", state=task.state)
+                            model = invoice_service.invoice_model(job.result, selections=selections,
+                                                                  database_id=self.invoice_context(job))
+                            reasons = invoice_service.exchange_reasons(model)
+                            if reasons:
+                                return 202, dict(error="Черновик не завершён.", reasons=reasons, state=task.state)
+                            current = task
+                            task, _ = exchange.confirm(
+                                task.task_id, model['revision'], fingerprint,
+                                lambda version: contract.build_snapshot(current, model, job.result, version,
+                                                                        status='ready_unconfirmed'),
+                                confirmed=False)
                     except (ValueError, ExchangeConflict) as error:
                         return 409, dict(error=str(error))
                     except OSError:
@@ -488,7 +503,7 @@ def create_server(host=None, port=None, output_dir=None, processor=None, max_upl
                     return self.send_json(dict(
                         error="Результат изменён после подтверждения; квитанция не принята.",
                         reasons=[task.stale_reason]), 409)
-                if task.confirmed_at is None or not task.result.get("checksum"):
+                if not task.result.get("checksum"):
                     return self.send_json(dict(error="Результат ещё не подтверждён."), 409)
                 if version != task.result_version:
                     return self.send_json(dict(
